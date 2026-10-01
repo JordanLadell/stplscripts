@@ -1,3 +1,12 @@
+// ============================================================
+// STOP: If you are reading this as plain text, Tampermonkey is
+// NOT installed in this browser. Install it first, then reopen
+// this exact page/link to trigger the script install prompt.
+//
+//   1) Install Tampermonkey:  https://www.tampermonkey.net/
+//   2) Reload this page to install the script automatically.
+// ============================================================
+
 // ==UserScript==
 // @name         Vision - Live Bulk Picker TV Dashboard
 // @namespace    staples.orlando.vision.bulk
