@@ -8,6 +8,8 @@
 // @grant        GM_xmlhttpRequest
 // @connect      lcvyprwbv05.staples.com
 // @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/JordanLadell/stplscripts/master/Vision-Bulk-TV-Dashboard.user.js
+// @downloadURL  https://raw.githubusercontent.com/JordanLadell/stplscripts/master/Vision-Bulk-TV-Dashboard.user.js
 // ==/UserScript==
 (() => {
   'use strict';
