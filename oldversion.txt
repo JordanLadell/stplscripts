@@ -1,0 +1,1212 @@
+// ==UserScript==
+// @name         Vision - Live Breakpack Picker TV Dashboard
+// @namespace    staples.orlando.vision
+// @version      7.0.0
+// @description  Live TV dashboard for Breakpack picker productivity using the Vision Associate Productivity API.
+// @match        https://sci-prod.az.staples.com/vision/clientWeb/flr/associateProductivity/*
+// @match        https://sci-prod.az.staples.com/vision/clientWeb/flr/associateProductivity*
+// @grant        GM_xmlhttpRequest
+// @connect      lcvyprwbv05.staples.com
+// @run-at       document-start
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  const CONFIG = {
+    apiPath: '/vision/clientWeb/flr/api/associateProductivity/',
+    refreshMs: 30000,
+    timeoutMs: 90000,
+    cardsPerPage: 16,
+    pageRotateMs: 12000,
+    activeMinutes: 20,
+    breakpackJobFunctionValues: [2, 3],
+    secondShiftCutoff: '12:45',
+    operationalDayStartHour: 4,
+    paceSheetBaseLph: 95,
+    useAdjustedUnits: true,
+    settingsKey: 'visionLivePickerDashboardSettingsV1',
+    zoneUrl: 'http://lcvyprwbv05.staples.com:8801/Home/ZoneManagement?order=recommended&includePTC=false',
+    hubStatusUrl: 'http://lcvyprwbv05.staples.com:8801/Home/HubStatusDP',
+    unpickedLinesUrl: 'http://lcvyprwbv05.staples.com:8801/Home/UnpickedLines',
+    zoneRefreshMs: 10000
+  };
+
+  const APP_ID = 'vision-live-breakpack-tv';
+  const state = {
+    token: '', data: null, pickers: [], page: 0, sort: 'name', filter: '',
+    running: false, refreshing: false, visionRequestId: 0, visionController: null, loadingDate: null, overlay: null, frame: null, ui: null,
+    refreshTimer: null, rotateTimer: null, lastRefresh: null, lastDuration: 0,
+    lastError: '', requestCount: 0, responseBytes: 0, selectedDate: '',
+    zones: [], zoneError: '', zoneLastRefresh: null, zoneTimer: null, kpiRefreshBusy: false, kpiError: '', kpiLastRefresh: null, kpis: { modsCartons: null, inZoneCartons: null, linesRemaining: null, efficiency: null }, showZones: true, rankingMode: 'minutes', rankingAmount: 60, rankingPeople: 6, tickerItems: null,
+    cardText: null, sidebarText: null, autoFitCards: true, sidebarWidthPercent: 22, conveyorBaselinePercent: 45.24, cardScale: 1, resizeObserver: null, rankingResults: [], rankingStart: null, rankingEnd: null, rankingError: '',
+    operation: 'breakpack', zonePaceOverrides: { 'ZONE 106': 100, 'WA35': 100 }, detectedPaceAreas: [], breakpackGroups: new Set(['1', '2']), excludedUsernames: new Set(), minimumUnits: 0, cardSizing: null, autoRotate: true, pageRotateSeconds: 12, refreshSeconds: 30, userGroups: [], userGroupAssignments: {}
+  };
+
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[char]));
+  const n = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const fmt = value => Math.round(n(value)).toLocaleString();
+  const hrs = value => n(value).toFixed(2);
+  const pct = value => Number.isFinite(Number(value)) ? `${Math.round(Number(value))}%` : '--';
+  const paceText = value => Number.isFinite(Number(value)) ? String(Math.round(Number(value))) : '--';
+  const formatLocalDate = date => {
+    const d = new Date(date);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
+  const operationalDate = (date = new Date()) => {
+    const d = new Date(date);
+    if (d.getHours() < CONFIG.operationalDayStartHour) d.setDate(d.getDate() - 1);
+    return formatLocalDate(d);
+  };
+  const localDate = () => operationalDate();
+  const operationalWindow = (dateText = operationalDate()) => {
+    const start = new Date(`${dateText}T00:00:00`);
+    start.setHours(CONFIG.operationalDayStartHour, 0, 0, 0);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+    return { start, end };
+  };
+  const parseDate = value => {
+    if (!value) return null;
+    const d = new Date(String(value).replace(' ', 'T'));
+    return Number.isNaN(d.getTime()) ? null : d;
+  };
+  const timeText = value => {
+    const d = value instanceof Date ? value : parseDate(value);
+    return d ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '--';
+  };
+  const minutesAgo = date => date ? Math.max(0, Math.floor((Date.now() - date.getTime()) / 60000)) : 99999;
+  const formatDuration = seconds => {
+    const totalMinutes = Math.max(0, Math.round(n(seconds) / 60));
+    const h = Math.floor(totalMinutes / 60), m = totalMinutes % 60;
+    return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
+  };
+  const isTodayReport = () => (state.selectedDate || operationalDate()) === operationalDate();
+  function currentBreakInfo(allDetails) {
+    if (!isTodayReport() || !Array.isArray(allDetails) || !allDetails.length) return null;
+    const timestamp = detail => parseDate(detail?.end)?.getTime() || parseDate(detail?.start)?.getTime() || 0;
+    const ordered = [...allDetails].sort((a, b) => timestamp(a) - timestamp(b));
+    const latestActivity = ordered.at(-1);
+    const breakRecords = ordered.filter(detail => {
+      const label = String(detail?.label || detail?.job_function?.display_value || '').toLowerCase();
+      return label.includes('lunch') || label.includes('break');
+    });
+    const latestBreak = breakRecords.at(-1);
+    if (!latestActivity || !latestBreak || latestBreak !== latestActivity) return null;
+    const label = String(latestBreak.label || latestBreak.job_function?.display_value || '').toLowerCase();
+    const type = label.includes('lunch') ? 'Lunch' : 'Break';
+    const start = parseDate(latestBreak.start);
+    const end = parseDate(latestBreak.end);
+    const seconds = Math.max(0, n(latestBreak.total_seconds) || (start && end ? (end - start) / 1000 : 0));
+    return { type, elapsed: Math.max(0, Math.round(seconds / 60)) };
+  }
+  function autoShiftFromFirstPick(details) {
+    const starts=(details||[]).map(d=>parseDate(d.start)).filter(Boolean).sort((a,b)=>a-b);
+    if(!starts.length)return null;
+    const first=starts[0], [hour,minute]=CONFIG.secondShiftCutoff.split(':').map(Number);
+    const cutoff=new Date(first); cutoff.setHours(hour,minute,0,0);
+    return {number:first<cutoff?'1':'2',label:first<cutoff?'First Shift':'Second Shift',firstPick:first};
+  }
+  function captureToken(value) {
+    if (!value) return;
+    const text = String(value);
+    const match = text.match(/^Token\s+(.+)$/i);
+    if (match && match[1].length > 10) state.token = match[1].trim();
+  }
+
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = function(input, init = {}) {
+    try {
+      const headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
+      captureToken(headers.get('authorization'));
+    } catch (_) {}
+    return nativeFetch(input, init);
+  };
+
+  const nativeSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    if (String(name).toLowerCase() === 'authorization') captureToken(value);
+    return nativeSetRequestHeader.apply(this, arguments);
+  };
+
+  function scanStorageForToken() {
+    for (const store of [window.localStorage, window.sessionStorage]) {
+      try {
+        for (let i = 0; i < store.length; i++) {
+          const key = store.key(i);
+          const value = store.getItem(key) || '';
+          captureToken(value);
+          if (!state.token && /token|auth/i.test(key)) {
+            try {
+              const parsed = JSON.parse(value);
+              const stack = [parsed];
+              while (stack.length && !state.token) {
+                const item = stack.pop();
+                if (typeof item === 'string') captureToken(item);
+                else if (item && typeof item === 'object') Object.values(item).forEach(v => stack.push(v));
+              }
+            } catch (_) {
+              if (/^[a-f0-9]{30,}$/i.test(value)) state.token = value;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
+  function buildApiUrl(date) {
+    const url = new URL(CONFIG.apiPath, location.origin);
+    url.searchParams.append('date_range', date);
+    url.searchParams.append('date_range', date);
+    url.searchParams.set('count', '1');
+    return url;
+  }
+
+  async function fetchVision(date, controller = new AbortController(), timeoutMs = CONFIG.timeoutMs) {
+    scanStorageForToken();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const headers = { accept: 'application/json, text/plain, */*' };
+    if (state.token) headers.authorization = `Token ${state.token}`;
+    const started = performance.now();
+    try {
+      const response = await nativeFetch(buildApiUrl(date), {
+        method: 'GET', credentials: 'include', cache: 'no-store', headers, signal: controller.signal
+      });
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          throw new Error('Vision authorization was not captured. Refresh the Associate Productivity page once, then reopen the dashboard.');
+        }
+        throw new Error(`Vision API returned HTTP ${response.status}`);
+      }
+      const text = await response.text();
+      state.responseBytes = new Blob([text]).size;
+      const json = JSON.parse(text);
+      if (!Array.isArray(json.associateDetails)) throw new Error('associateDetails was not found in the Vision response.');
+      state.lastDuration = Math.round(performance.now() - started);
+      return json;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+
+  function isBreakpack(detail) {
+    const jobValue = Number(detail?.job_function?.value);
+    const jobName = String(detail?.job_function?.display_value || '')
+      .trim()
+      .toLowerCase();
+
+    return (
+      CONFIG.breakpackJobFunctionValues.includes(jobValue) ||
+      jobName === 'carton picking' ||
+      jobName === 'cart picking'
+    );
+  }
+
+  function normalizedPaceArea(detail) {
+    return String(detail?.work_location || '').trim().replace(/\s+/g, ' ').toUpperCase();
+  }
+  function isModsProduction(detail) {
+    const jobName = String(detail?.job_function?.display_value || '').trim().toLowerCase();
+    const area = normalizedPaceArea(detail);
+    return jobName === 'carton picking' && (/^ZONE\s+\d{3}$/.test(area) || area === 'WA35');
+  }
+  function zoneOverrideRate(detailOrArea) {
+    const area = typeof detailOrArea === 'string'
+      ? String(detailOrArea).trim().replace(/\s+/g, ' ').toUpperCase()
+      : normalizedPaceArea(detailOrArea);
+    const value = Number(state.zonePaceOverrides?.[area]);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+  function detailWeightedLines(detail, ratio = 1) {
+    const seconds = Math.max(0, n(detail?.working_seconds)) * ratio;
+    const override = zoneOverrideRate(detail);
+    if (override !== null) return (seconds / 3600) * override;
+    return Math.max(0, n(detail?.earned_hours)) * ratio * CONFIG.paceSheetBaseLph;
+  }
+  function selectedWork(detail) {
+    return isModsProduction(detail);
+  }
+
+  function operationName() {
+    return 'MODs';
+  }
+
+  function unitLabel() {
+    return 'Lines';
+  }
+
+  function summarizeAssociate(associate) {
+    const selectedDay = state.selectedDate || operationalDate();
+    const { start: operationalStart, end: operationalEnd } = operationalWindow(selectedDay);
+    const allSource = Array.isArray(associate.time_details) ? associate.time_details : [];
+    const all = allSource.filter(detail => {
+      const detailStart = parseDate(detail.start);
+      const detailEnd = parseDate(detail.end) || detailStart;
+      return detailStart && detailEnd && detailEnd > operationalStart && detailStart < operationalEnd;
+    });
+    const bulk = all.filter(isModsProduction);
+    if (!bulk.length) return null;
+    const orderedAll = [...all].sort((a, b) => (parseDate(a.end)?.getTime() || 0) - (parseDate(b.end)?.getTime() || 0));
+    const orderedBulk = [...bulk].sort((a, b) => (parseDate(a.end)?.getTime() || 0) - (parseDate(b.end)?.getTime() || 0));
+    const latestOverall = orderedAll.at(-1) || null;
+    const latestBulk = orderedBulk.at(-1) || null;
+    const rawUnits = bulk.reduce((sum, d) => sum + n(d.unit_quantity), 0);
+    const adjusted = bulk.reduce((sum, d) => sum + n(d.adjusted_unit_quantity), 0);
+    const units = adjusted;
+    const seconds = bulk.reduce((sum, d) => sum + n(d.working_seconds), 0);
+    const earned = bulk.reduce((sum, d) => sum + n(d.earned_hours), 0);
+    const weightedLines = bulk.reduce((sum, d) => sum + detailWeightedLines(d), 0);
+    const rate = seconds > 0 ? units / (seconds / 3600) : 0;
+    const adjustedRate = seconds > 0 ? adjusted / (seconds / 3600) : 0;
+    const performance = seconds > 0 && earned > 0 ? earned / (seconds / 3600) * 100 : null;
+    const areas = {};
+    for (const d of bulk) {
+      const area = String(d.work_location || 'UNASSIGNED').trim().toUpperCase();
+      if (!areas[area]) areas[area] = { area, units: 0, adjusted: 0, seconds: 0, earned: 0, records: 0 };
+      areas[area].units += n(d.adjusted_unit_quantity);
+      areas[area].adjusted += n(d.adjusted_unit_quantity);
+      areas[area].seconds += n(d.working_seconds);
+      areas[area].earned += n(d.earned_hours);
+      areas[area].records++;
+    }
+    const offStandard = { approvedSeconds: 0, pendingSeconds: 0, partialSeconds: 0, deniedSeconds: 0, deniedPartialSeconds: 0, totalSeconds: 0, records: [] };
+    for (const d of all) {
+      if (!d.offstandard) continue;
+      const statusName = String(d.offstandard.status || '').toUpperCase();
+      const totalSeconds = Math.max(0, n(d.total_seconds));
+      const approvedSeconds = Math.max(0, n(d.offstandard.approved_time) * 60);
+      offStandard.totalSeconds += totalSeconds;
+      offStandard.records.push(d);
+      if (statusName === 'APPROVED') offStandard.approvedSeconds += totalSeconds;
+      else if (statusName === 'PENDING' || statusName === 'CREATED') offStandard.pendingSeconds += totalSeconds;
+      else if (statusName === 'DENIED') offStandard.deniedSeconds += totalSeconds;
+      else if (statusName === 'PARTIAL') {
+        const approvedPartialSeconds = Math.min(totalSeconds, approvedSeconds);
+        const deniedPartialSeconds = Math.max(0, totalSeconds - approvedPartialSeconds);
+        offStandard.partialSeconds += totalSeconds;
+        offStandard.approvedSeconds += approvedPartialSeconds;
+        offStandard.deniedPartialSeconds += deniedPartialSeconds;
+      }
+    }
+    const deniedPenaltySeconds = offStandard.deniedSeconds + offStandard.deniedPartialSeconds;
+    const paceSeconds = seconds;
+    const paceRate = paceSeconds > 0 ? units / (paceSeconds / 3600) : 0;
+    const pacePerformance = paceSeconds > 0 ? weightedLines / (paceSeconds / 3600) : null;
+    const latestEnd = parseDate(latestOverall?.end);
+    let status = latestOverall?.label || latestOverall?.job_function?.display_value || 'No Status';
+    if (latestOverall && selectedWork(latestOverall)) status = 'Breakpack Picking';
+    const offStatus = latestOverall?.offstandard?.status || '';
+    const breakInfo = currentBreakInfo(all);
+    const autoShift = autoShiftFromFirstPick(bulk);
+    return {
+      id: associate.id, label: associate.label || associate.full_name || String(associate.employee_id),
+      fullName: associate.full_name || '', employeeId: associate.employee_id || '',
+      units, adjusted, seconds, earned, rate, adjustedRate, performance,
+      paceRate, pacePerformance, weightedLines, deniedPenaltySeconds, offStandard,
+      latestOverall, latestBulk, latestEnd, currentArea: latestBulk?.work_location || 'UNASSIGNED',
+      status, offStatus, breakInfo, autoShift, active: minutesAgo(latestEnd) <= CONFIG.activeMinutes,
+      bulk, all, areas: Object.values(areas).sort((a, b) => b.units - a.units)
+    };
+  }
+
+  function processData(json) {
+    state.data = json;
+    const detected = new Set(Object.keys(state.zonePaceOverrides || {}));
+    for (const associate of (json.associateDetails || [])) {
+      for (const detail of (associate.time_details || [])) {
+        if (isModsProduction(detail)) detected.add(normalizedPaceArea(detail));
+      }
+    }
+    state.detectedPaceAreas = [...detected].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    const excluded = new Set([...state.excludedUsernames].map(value => value.toLowerCase()));
+    state.pickers = json.associateDetails.filter(a => !excluded.has(String(a.label || '').trim().toLowerCase())).map(summarizeAssociate).filter(p => p && p.autoShift && state.breakpackGroups.has(p.autoShift.number) && p.units >= state.minimumUnits);
+    state.lastRefresh = new Date();
+    state.requestCount++;
+    state.lastError = '';
+  }
+
+  function sortedPickers() {
+    const query = state.filter.trim().toLowerCase();
+    const list = state.pickers.filter(p => !query || `${p.label} ${p.fullName} ${p.currentArea}`.toLowerCase().includes(query));
+    list.sort((a, b) => {
+      if (state.sort === 'recent') return (b.latestEnd?.getTime() || 0) - (a.latestEnd?.getTime() || 0);
+      if (state.sort === 'rate') return b.paceRate - a.paceRate;
+      if (state.sort === 'performance') return n(b.pacePerformance) - n(a.pacePerformance);
+      if (state.sort === 'name') return a.label.localeCompare(b.label);
+      return (CONFIG.useAdjustedUnits ? b.adjusted - a.adjusted : b.units - a.units);
+    });
+    return list;
+  }
+
+  async function refresh(requestedDate = null, options = {}) {
+    if (!state.running && !options.force) return;
+    const targetDate = requestedDate || state.ui?.date?.value || state.selectedDate || localDate();
+    const historical = targetDate !== operationalDate();
+
+    if (options.supersede && state.visionController) {
+      try { state.visionController.abort(); } catch (_) {}
+    } else if (state.refreshing) {
+      return;
+    }
+
+    const requestId = ++state.visionRequestId;
+    const controller = new AbortController();
+    state.visionController = controller;
+    state.refreshing = true;
+    state.loadingDate = targetDate;
+    state.lastError = '';
+    renderStatus();
+    renderCards();
+
+    try {
+      const json = await fetchVision(targetDate, controller, historical ? 90000 : CONFIG.timeoutMs);
+      if (requestId !== state.visionRequestId) return;
+
+      const selectedNow = state.ui?.date?.value || state.selectedDate || localDate();
+      if (selectedNow !== targetDate) return;
+
+      state.selectedDate = targetDate;
+      processData(json);
+      state.loadingDate = null;
+      render();
+    } catch (error) {
+      if (requestId !== state.visionRequestId) return;
+      state.loadingDate = null;
+      if (error.name !== 'AbortError') {
+        state.lastError = error.message || String(error);
+      } else if (!options.supersede) {
+        state.lastError = `Vision request for ${targetDate} timed out.`;
+      }
+      render();
+    } finally {
+      if (requestId === state.visionRequestId) {
+        state.refreshing = false;
+        state.loadingDate = null;
+        state.visionController = null;
+        renderStatus();
+        renderCards();
+      }
+    }
+  }
+  function restartDashboardTimers() {
+    clearInterval(state.refreshTimer);
+    clearInterval(state.rotateTimer);
+    clearInterval(state.zoneTimer);
+    state.refreshTimer = null;
+    state.rotateTimer = null;
+    if (!state.running) return;
+    state.refreshTimer = setInterval(() => {
+      if ((state.ui?.date?.value || state.selectedDate) === operationalDate()) refresh();
+    }, state.refreshSeconds * 1000);
+    if (state.autoRotate) {
+      state.rotateTimer = setInterval(() => {
+        if (!state.running || !state.ui || state.ui.detailOpen) return;
+        const pageSize = Math.max(1, (state.cardSizing?.columns || 4) * (state.cardSizing?.rows || 4));
+        const pages = Math.max(1, Math.ceil(sortedPickers().length / pageSize));
+        if (pages <= 1) return;
+        state.page = (state.page + 1) % pages;
+        renderCards();
+      }, state.pageRotateSeconds * 1000);
+    }
+  }
+  function start() {
+    if (state.running) return;
+    state.running = true;
+    refresh(state.ui?.date?.value || state.selectedDate, { force: true, supersede: true });
+    restartDashboardTimers();
+    restartZoneTimer();
+    renderStatus();
+  }
+
+  function stop() {
+    state.running = false;
+    state.refreshing = false;
+    state.loadingDate = null;
+    if (state.visionController) { try { state.visionController.abort(); } catch (_) {} }
+    state.visionController = null;
+    state.visionRequestId++;
+    clearInterval(state.refreshTimer);
+    clearInterval(state.rotateTimer);
+    state.refreshTimer = null;
+    state.rotateTimer = null;
+    state.zoneTimer = null;
+    renderStatus();
+  }
+
+  function performanceClass(value) {
+    if (!Number.isFinite(Number(value))) return 'neutral';
+    if (value >= 100) return 'good';
+    if (value >= 85) return 'warn';
+    return 'bad';
+  }
+
+  function renderStatus() {
+    if (!state.ui) return;
+    const parts = [state.running ? (state.refreshing ? 'REFRESHING' : 'LIVE') : 'STOPPED'];
+    parts.push(`${state.loadingDate ? 'Loading' : 'Operational Date'}: ${state.loadingDate || state.selectedDate || operationalDate()} (4:00 AM reset)`);
+    if (state.lastRefresh) parts.push(`Updated: ${state.lastRefresh.toLocaleTimeString()}`);
+    if (state.lastDuration) parts.push(`API: ${state.lastDuration} ms`);
+    if (state.responseBytes) parts.push(`Response: ${(state.responseBytes / 1024 / 1024).toFixed(1)} MB`);
+    if (state.lastError) parts.push(`ERROR: ${state.lastError}`);
+    state.ui.status.textContent = parts.join(' | ');
+    state.ui.start.disabled = state.running;
+    state.ui.stop.disabled = !state.running;
+  }
+
+  function shiftSummary(shiftNumber) {
+    const pickers = state.pickers.filter(picker => picker.autoShift?.number === String(shiftNumber));
+    const lines = pickers.reduce((sum, picker) => sum + picker.units, 0);
+    const productiveSeconds = pickers.reduce((sum, picker) => sum + picker.seconds, 0);
+    const deniedSeconds = pickers.reduce((sum, picker) => sum + picker.deniedPenaltySeconds, 0);
+    const earnedHours = pickers.reduce((sum, picker) => sum + picker.earned, 0);
+    const weightedLines = pickers.reduce((sum, picker) => sum + picker.weightedLines, 0);
+    const adjustedSeconds = productiveSeconds;
+    return {
+      pickers: pickers.length,
+      active: isTodayReport() ? pickers.filter(picker => picker.active).length : null,
+      lines,
+      pace: adjustedSeconds > 0 ? lines / (adjustedSeconds / 3600) : 0,
+      performance: adjustedSeconds > 0 ? weightedLines / (adjustedSeconds / 3600) : null
+    };
+  }
+  function renderTicker() {
+    if (!state.ui) return;
+    const list = state.pickers;
+    const first = shiftSummary('1');
+    const second = shiftSummary('2');
+    const active = isTodayReport() ? list.filter(picker => picker.active).length : 'N/A';
+    const topThree = [...list]
+      .filter(picker => Number.isFinite(Number(picker.pacePerformance)))
+      .sort((a, b) => b.pacePerformance - a.pacePerformance || b.units - a.units)
+      .slice(0, 3);
+
+    const enabled=state.tickerItems||DEFAULT_TICKER_ITEMS;
+    const items = [
+      enabled.firstPerf && ['1ST SHIFT AVG LPH', paceText(first.performance)],
+      enabled.secondPerf && ['2ND SHIFT AVG LPH', paceText(second.performance)],
+      enabled.active && ['TOTAL ACTIVE PICKERS', active],
+      enabled.top1 && ['TOP ADJUSTED LPH', topThree[0] ? `${topThree[0].label} ${paceText(topThree[0].pacePerformance)}` : '--'],
+      enabled.top2 && ['2ND ADJUSTED LPH', topThree[1] ? `${topThree[1].label} ${paceText(topThree[1].pacePerformance)}` : '--'],
+      enabled.top3 && ['3RD ADJUSTED LPH', topThree[2] ? `${topThree[2].label} ${paceText(topThree[2].pacePerformance)}` : '--'],
+      enabled.firstPicks && ['1ST SHIFT PICKS', fmt(first.lines)],
+      enabled.secondPicks && ['2ND SHIFT PICKS', fmt(second.lines)]
+    ].filter(Boolean);
+
+    const itemHtml = items
+      .map(([label, value]) => `<div class="tickerItem"><b>${esc(label)}</b><strong>${esc(value)}</strong></div>`)
+      .join('');
+
+    state.ui.ticker.innerHTML = `<div class="tickerTrack"><div class="tickerSet">${itemHtml}</div><div class="tickerSet" aria-hidden="true">${itemHtml}</div></div>`;
+  }
+  function isNormalNumberedZone(detail) {
+    return isModsProduction(detail);
+  }
+  function rankingWindow() {
+    const end=new Date(), {start:dayStart}=operationalWindow(operationalDate(end));
+    if(state.rankingMode==='today')return {start:dayStart,end,label:'TODAY OVERALL'};
+    const amount=state.rankingMode==='hours'?state.rankingAmount*3600000:state.rankingAmount*60000;
+    const unit=state.rankingMode==='hours'?(state.rankingAmount===1?'HOUR':'HOURS'):(state.rankingAmount===1?'MINUTE':'MINUTES');
+    return {start:new Date(Math.max(dayStart.getTime(),end.getTime()-amount)),end,label:`LAST ${state.rankingAmount} ${unit}`};
+  }
+  function calculateLastHourRankings() {
+    if(!isTodayReport())return [];
+    const {start:windowStart,end:windowEnd}=rankingWindow();
+    return state.pickers.map(picker=>{
+      let units=0,productiveSeconds=0,earned=0,weightedLines=0,deniedSeconds=0;
+      for(const d of picker.all.filter(isNormalNumberedZone)){
+        const start=parseDate(d.start),end=parseDate(d.end);if(!start||!end||end<=windowStart||start>=windowEnd)continue;
+        const duration=Math.max(1,(end-start)/1000), overlap=Math.max(0,(Math.min(end,windowEnd)-Math.max(start,windowStart))/1000), ratio=Math.min(1,overlap/duration);
+        units+=n(d.adjusted_unit_quantity)*ratio;
+        productiveSeconds+=n(d.working_seconds)*ratio;
+        earned+=n(d.earned_hours)*ratio;
+        weightedLines+=detailWeightedLines(d,ratio);
+      }
+      for(const d of picker.all.filter(detail=>detail?.offstandard)){
+        const start=parseDate(d.start),end=parseDate(d.end);if(!start||!end||end<=windowStart||start>=windowEnd)continue;
+        const duration=Math.max(1,(end-start)/1000), overlap=Math.max(0,(Math.min(end,windowEnd)-Math.max(start,windowStart))/1000), ratio=Math.min(1,overlap/duration);
+        const totalSeconds=Math.max(0,n(d.total_seconds))*ratio;
+        const status=String(d.offstandard?.status||'').toUpperCase();
+        if(status==='DENIED') deniedSeconds+=totalSeconds;
+        else if(status==='PARTIAL'){
+          const approvedSeconds=Math.max(0,n(d.offstandard?.approved_time)*60)*ratio;
+          deniedSeconds+=Math.max(0,totalSeconds-approvedSeconds);
+        }
+      }
+      const adjustedSeconds=productiveSeconds;
+      return {label:picker.label,lines:units,productiveSeconds,deniedSeconds,performance:adjustedSeconds>0?weightedLines/(adjustedSeconds/3600):null};
+    }).filter(x=>Number.isFinite(x.performance)).sort((a,b)=>b.performance-a.performance||b.lines-a.lines);
+  }
+  function renderCards() {
+    if (!state.ui) return;
+    if (state.ui.rankingTitle) state.ui.rankingTitle.textContent = rankingWindow().label;
+    const rankingPanel=state.ui.rank?.closest('.rankingPanel');
+    const side=state.ui.rank?.closest('.side');
+    if(rankingPanel&&side&&state.showZones&&!zoneHiddenForToday()){
+      const people=Math.min(100,Math.max(1,Number(state.rankingPeople)||6));
+      const sidebarScale=Number(getComputedStyle(state.frame.contentDocument.documentElement).getPropertyValue('--sidebar-scale'))||1;
+      const rowHeight=Math.max(25,34*sidebarScale);
+      const desired=Math.max(150,Math.min(side.clientHeight*.46,58+people*rowHeight));
+      const kpiHeight=Math.max(170,Math.min(245,side.clientWidth*.56));
+      side.style.gridTemplateRows=`${Math.round(kpiHeight)}px ${Math.round(desired)}px minmax(0,1fr)`;
+    }
+    const list = sortedPickers();
+    const pageSize = Math.max(1, (state.cardSizing?.columns || 4) * (state.cardSizing?.rows || 4));
+    const pages = Math.max(1, Math.ceil(list.length / pageSize));
+    state.page = ((state.page % pages) + pages) % pages;
+    const shown = list.slice(state.page * pageSize, (state.page + 1) * pageSize);
+    state.ui.page.textContent = `PICKERS ${list.length} | PAGE ${state.page + 1}/${pages}`;
+    state.ui.cards.innerHTML = shown.map((p, index) => {
+      const perf = p.pacePerformance;
+      const unitValue = p.weightedLines;
+      const rank = state.page * pageSize + index + 1;
+      const statusText = p.offStatus ? `${p.status} - ${p.offStatus}` : p.status;
+      const liveClass = isTodayReport() ? (p.active ? 'todayActive' : 'todayInactive') : 'historical';
+      return `<article class="pickerCard ${liveClass}" data-id="${esc(p.id)}">
+        <div class="cardHead"><div class="identity"><div class="identityTop"><h2>${esc(p.label)}</h2><span class="shiftTag ${p.autoShift.number === '1' ? 'first' : 'second'}" title="First pick: ${timeText(p.autoShift.firstPick)}">${p.autoShift.label}</span></div><small>${esc(p.fullName)}</small></div><div></div><div class="heroValue" title="Weighted Lines">${fmt(unitValue)}</div></div>
+        <div class="areaRow"><div class="area">${esc(p.currentArea)}</div>${p.breakInfo ? `<div class="zoneBreakStatus ${p.breakInfo.type.toLowerCase()}">ON ${p.breakInfo.type.toUpperCase()}</div>` : ''}</div>
+        <div class="metrics primaryMetrics">
+          <div class="performanceMetric"><span title="95 x Vision Performance Multiplier">ADJUSTED LPH</span><b class="${performanceClass(p.pacePerformance)}">${paceText(p.pacePerformance)}</b></div>
+          <div><span>WORK HOURS</span><b>${hrs(p.seconds / 3600)}</b></div>
+                    <div><span>LAST ACTIVITY</span><b>${timeText(p.latestEnd)}</b></div>
+        </div>
+        <div class="offStandardBlock"><div class="offTitle"><span>OFF-STANDARD</span><b>${formatDuration(p.offStandard.totalSeconds)}</b></div>
+        <div class="offGrid">
+          <div class="approved"><span>APPROVED</span><b>${formatDuration(p.offStandard.approvedSeconds)}</b></div>
+          <div class="pending"><span>PENDING</span><b>${formatDuration(p.offStandard.pendingSeconds)}</b></div>
+          <div class="denied"><span>DENIED</span><b>${formatDuration(p.offStandard.deniedSeconds + p.offStandard.deniedPartialSeconds)}</b></div>
+        </div></div>
+      </article>`;
+    }).join('') || `<div class="empty">${state.loadingDate ? `Loading ${esc(state.loadingDate)}...` : state.lastError ? `Could not load ${esc(state.selectedDate || localDate())}: ${esc(state.lastError)}` : 'No MODs Carton Picking or WA35 records were found for the selected shifts and date.'}</div>`;
+    state.ui.cards.querySelectorAll('.pickerCard').forEach(card => {
+      card.onclick = () => openPickerDetail(state.pickers.find(p => String(p.id) === card.dataset.id));
+    });
+    const rankingLimit = Math.min(100, Math.max(1, Number(state.rankingPeople) || 6));
+    const leaders = calculateLastHourRankings().slice(0, rankingLimit);
+    state.ui.rank.innerHTML = isTodayReport()
+      ? (leaders.map((p, i) => `<div title="Adjusted productivity includes denied off-standard time"><span>${i + 1}</span><b>${esc(p.label)}</b><strong>${paceText(p.performance)}</strong></div>`).join('') || '<div class="rankingEmpty">No Breakpack lines in the last hour.</div>')
+      : '<div class="rankingEmpty">Last-hour rankings are available only for today.</div>';
+  }
+
+  function parseZoneManagementHtml(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const heading = [...doc.querySelectorAll('h1,h2,h3')].some(node => /zone management/i.test(node.textContent || ''));
+    const table = [...doc.querySelectorAll('table')].find(candidate => /rec\.\s*pickers/i.test(candidate.tHead?.textContent || ''));
+    if (!heading || !table) throw new Error('LOGIN_REQUIRED');
+    const headers = [...table.querySelectorAll('thead th')].map(th => th.textContent.replace(/\s+/g, ' ').trim().toLowerCase());
+    const index = name => headers.findIndex(header => header === name || header.includes(name));
+    const indexes = { location:index('location'), inZone:index('in zone'), inactive:index('inactive'), traveling:index('traveling'), packsize:index('packsize'), induction:index('induction'), pickers:index('pickers'), qty:index('pickers quantity'), recommended:index('rec. pickers') };
+    return [...table.querySelectorAll('tbody tr')].map(row => {
+      const cells=[...row.cells];
+      const text = key => indexes[key] >= 0 ? (cells[indexes[key]]?.textContent || '').replace(/\s+/g,' ').trim() : '';
+      const num = key => Number(text(key).replace(/,/g,'')) || 0;
+      const location=text('location');
+      if (!location || /^total$/i.test(location)) return null;
+      const pickerQty=num('qty'), recommended=num('recommended');
+      const cleanLocation=location.replace(/^M(?=\d)/i,'');
+      const cartonsInZone=num('inZone')+num('inactive');
+      const cartonsOnTheWay=num('traveling')+num('packsize')+num('induction');
+      return {location:cleanLocation,cartonsInZone,cartonsOnTheWay,totalCartons:cartonsInZone+cartonsOnTheWay,pickers:text('pickers'),pickerQty,recommended,need:recommended-pickerQty};
+    }).filter(Boolean).sort((a,b)=>b.need-a.need||b.totalCartons-a.totalCartons||a.location.localeCompare(b.location,undefined,{numeric:true}));
+  }
+  function zoneHiddenForToday() {
+    return sessionStorage.getItem('visionZonePanelHiddenDate') === operationalDate();
+  }
+  function parseHubStatusHtml(html) {
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const table=[...doc.querySelectorAll('table')].find(t=>/\bmod\b/i.test(t.tHead?.textContent||'')&&/\btotal\b/i.test(t.tHead?.textContent||''));
+    if(!table)throw new Error('LOGIN_REQUIRED');
+    const headers=[...table.querySelectorAll('thead th')].map(th=>th.textContent.replace(/\s+/g,' ').trim().toLowerCase());
+    const modIndex=headers.findIndex(h=>h==='mod');
+    if(modIndex<0)throw new Error('MOD_COLUMN_NOT_FOUND');
+    const totalRow=[...table.querySelectorAll('tbody tr')].find(row=>/^total$/i.test((row.cells[0]?.textContent||'').trim()));
+    if(!totalRow)throw new Error('HUB_TOTAL_NOT_FOUND');
+    return Number((totalRow.cells[modIndex]?.textContent||'0').replace(/[^0-9.-]/g,''))||0;
+  }
+  function parseUnpickedLinesHtml(html) {
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const text=doc.body?.textContent||'';
+    const match=text.match(/Total\s+Available\s+Lines\s*:\s*([\d,]+)/i);
+    if(match)return Number(match[1].replace(/,/g,''))||0;
+    const table=[...doc.querySelectorAll('table')].find(t=>/available lines/i.test(t.tHead?.textContent||''));
+    const totalRow=table?[...table.querySelectorAll('tbody tr')].find(r=>/^total$/i.test((r.cells[0]?.textContent||'').trim())):null;
+    if(totalRow)return Number((totalRow.cells[1]?.textContent||'0').replace(/[^0-9.-]/g,''))||0;
+    throw new Error('UNPICKED_TOTAL_NOT_FOUND');
+  }
+  function gmGet(url) {
+    return new Promise((resolve,reject)=>GM_xmlhttpRequest({method:'GET',url,timeout:15000,anonymous:false,onload:r=>r.status>=200&&r.status<400?resolve(r.responseText):reject(new Error(`HTTP ${r.status}`)),onerror:()=>reject(new Error('CONNECTION_FAILED')),ontimeout:()=>reject(new Error('REQUEST_TIMEOUT'))}));
+  }
+  function calculateKpis() {
+    const inZone=state.zones.reduce((sum,zone)=>sum+n(zone.cartonsInZone),0);
+    const mods=n(state.kpis.modsCartons);
+    const baseline=Math.max(1,n(state.conveyorBaselinePercent)||45.24);
+    const actualRatio=mods>0?inZone/mods*100:null;
+    state.kpis.inZoneCartons=inZone;
+    state.kpis.efficiency=actualRatio===null?null:actualRatio/baseline*100;
+  }
+  function renderKpis() {
+    if(!state.ui?.kpis)return;
+    calculateKpis();
+    const k=state.kpis,eff=Number(k.efficiency),effClass=!Number.isFinite(eff)?'neutral':eff>=100?'good':eff>=85?'warn':'bad';
+    const items=[['MODS CARTONS',k.modsCartons,'Cartons in MOD status from Hub Status'],['IN ZONES',k.inZoneCartons,'In Zone + Inactive across all MOD zones'],['LINES REMAINING',k.linesRemaining,'Total Available Lines from Unpicked Lines'],['CONVEYOR EFFICIENCY',Number.isFinite(eff)?`${Math.round(eff)}%`:'--',`In-Zone Cartons divided by MODS Cartons, compared with the ${state.conveyorBaselinePercent}% baseline`,effClass]];
+    state.ui.kpis.innerHTML=items.map(([label,value,title,cls=''])=>`<div class="kpiCard ${cls}" title="${esc(title)}"><span>${label}</span><b>${typeof value==='number'?fmt(value):(value??'--')}</b></div>`).join('');
+  }
+  async function requestDecisionPointData() {
+    if(!state.running||!state.showZones||zoneHiddenForToday()){renderZones();renderKpis();return;}
+    if(state.kpiRefreshBusy)return;
+    if(typeof GM_xmlhttpRequest!=='function'){state.zoneError='Decision Point connection is unavailable in this script runner.';state.kpiError=state.zoneError;renderZones();renderKpis();return;}
+    state.kpiRefreshBusy=true;
+    try {
+      const [zoneHtml,hubHtml,unpickedHtml]=await Promise.all([gmGet(CONFIG.zoneUrl),gmGet(CONFIG.hubStatusUrl),gmGet(CONFIG.unpickedLinesUrl)]);
+      state.zones=parseZoneManagementHtml(zoneHtml);
+      state.kpis.modsCartons=parseHubStatusHtml(hubHtml);
+      state.kpis.linesRemaining=parseUnpickedLinesHtml(unpickedHtml);
+      calculateKpis();state.zoneError='';state.kpiError='';state.zoneLastRefresh=new Date();state.kpiLastRefresh=new Date();
+    } catch(error) {
+      state.zoneError=error.message==='LOGIN_REQUIRED'?'LOGIN_REQUIRED':error.message;
+      state.kpiError=state.zoneError;
+    } finally {state.kpiRefreshBusy=false;renderKpis();renderZones();}
+  }
+  function requestZoneData() { return requestDecisionPointData(); }
+  function renderZones() {
+    if (!state.ui?.zones) return;
+    const side=state.ui.zones.closest('.side');
+    const zonePanel=state.ui.zones.closest('.zonePanel');
+    const rankingPanel=state.ui.rank?.closest('.rankingPanel');
+    const zonesVisible=state.showZones && !zoneHiddenForToday();
+    if(side){
+      side.classList.toggle('zonesOff',!zonesVisible);
+      if(!zonesVisible){const kpiHeight=Math.max(170,Math.min(245,side.clientWidth*.56));side.style.gridTemplateRows=`${Math.round(kpiHeight)}px minmax(0,1fr)`;}
+    }
+    if(zonePanel)zonePanel.hidden=!zonesVisible;
+    if(rankingPanel)rankingPanel.classList.toggle('fullHeight',!zonesVisible);
+    if (!zonesVisible) {
+      state.ui.zones.innerHTML='';
+      return;
+    }
+    if (state.zoneError) {
+      state.ui.zones.innerHTML=`<div class="zoneLogin"><b>Please log into Decision Point to display zones</b><span>Open Zone Management once in this browser, then click Retry.</span><div><button id="zoneLogin">Open Decision Point</button><button id="zoneRetry">Retry</button><button id="zoneHideToday">Hide Today</button></div></div>`;
+      state.ui.zones.querySelector('#zoneLogin').onclick=()=>window.open(CONFIG.zoneUrl,'_blank');
+      state.ui.zones.querySelector('#zoneRetry').onclick=requestZoneData;
+      state.ui.zones.querySelector('#zoneHideToday').onclick=()=>{sessionStorage.setItem('visionZonePanelHiddenDate',operationalDate());renderZones();};
+      return;
+    }
+    const needs=state.zones.filter(zone=>zone.need>0).slice(0,10);
+    state.ui.zones.innerHTML=needs.length?needs.map(zone=>{const critical=zone.need>=2||zone.totalCartons>50;return `<div class="zoneNeed ${critical?'criticalZone':''}"><div class="zoneNeedHeader"><b>${esc(zone.location)}</b><strong>NEEDS ${zone.need} PICKER${zone.need===1?'':'S'}</strong></div><div class="zoneCartonFlow"><div><span>IN ZONE</span><b>${fmt(zone.cartonsInZone)}</b></div><div><span>ON THE WAY</span><b>${fmt(zone.cartonsOnTheWay)}</b></div></div>${zone.pickers?`<span class="zonePickerNames">Current: ${esc(zone.pickers)}</span>`:''}</div>`;}).join(''):'<div class="zoneCovered">All listed zones meet recommended staffing.</div>';
+    if (state.ui.zoneStamp) state.ui.zoneStamp.textContent=state.zoneLastRefresh ? `Updated ${timeText(state.zoneLastRefresh)}` : 'Loading';
+  }
+  function restartZoneTimer() {
+    clearInterval(state.zoneTimer); state.zoneTimer=null;
+    if (!state.running || !state.showZones || zoneHiddenForToday()) return;
+    requestZoneData();
+    state.zoneTimer=setInterval(requestZoneData,CONFIG.zoneRefreshMs);
+  }
+  function renderActivity() {
+    if (!state.ui?.feed) return;
+    const recent = state.pickers.flatMap(p => p.bulk.map(d => ({ p, d, end: parseDate(d.end) })))
+      .sort((a, b) => (b.end?.getTime() || 0) - (a.end?.getTime() || 0)).slice(0, 12);
+    state.ui.rankingTitle.textContent = rankingWindow().label;
+    state.ui.activityTitle.textContent = `RECENT ${operationName().toUpperCase()} ACTIVITY`;
+    state.ui.feed.innerHTML = recent.map(x => `<div><time>${timeText(x.end)}</time><b>${esc(x.p.label)}</b><span>${esc(x.d.work_location || '')}</span><strong>+${fmt(x.d.unit_quantity)}</strong></div>`).join('');
+  }
+
+  function render() {
+    applyCardSizingToDashboard();
+    applyVisualSizing();
+    renderTicker();
+    renderCards();
+    requestAnimationFrame(fitRenderedCardsToHeight);
+    renderActivity();
+    renderKpis();
+    renderZones();
+    renderStatus();
+  }
+
+  function openPickerDetail(picker) {
+    if (!picker || !state.ui) return;
+    state.ui.detailOpen = true;
+    const doc = state.frame.contentDocument;
+    doc.getElementById('pickerDetail')?.remove();
+    const shade = doc.createElement('div');
+    shade.id = 'pickerDetail';
+    shade.className = 'detailShade';
+    const areaRows = picker.areas.map(a => {
+      const rate = a.seconds ? a.units / (a.seconds / 3600) : 0;
+      const override = zoneOverrideRate(a.area);
+      const perf = override !== null ? override : (a.seconds && a.earned ? CONFIG.paceSheetBaseLph * a.earned / (a.seconds / 3600) : null);
+      return `<tr><td>${esc(a.area)}</td><td>${fmt(a.units)}</td><td>${fmt(a.adjusted)}</td><td>${hrs(a.seconds / 3600)}</td><td>${fmt(rate)}</td><td>${paceText(perf)}${override !== null ? ' FLAT' : ''}</td></tr>`;
+    }).join('');
+    const activityRows = [...picker.all].sort((a, b) => (parseDate(b.end)?.getTime() || 0) - (parseDate(a.end)?.getTime() || 0)).map(d => {
+      const off = d.offstandard?.status || '';
+      return `<tr class="${selectedWork(d) ? 'bulkRow' : d.type === 'DOWNTIME' || d.type === 'REQUEST' ? 'offRow' : ''}"><td>${timeText(d.start)}</td><td>${timeText(d.end)}</td><td>${esc(d.job_function?.display_value || d.label || '')}</td><td>${esc(d.work_location || '')}</td><td>${fmt(d.unit_quantity)}</td><td>${fmt(d.adjusted_unit_quantity)}</td><td>${fmt(d.actual_rate)}</td><td>${pct(d.performance)}</td><td>${esc(off || d.type || '')}</td></tr>`;
+    }).join('');
+    shade.innerHTML = `<section class="detailBox"><header class="detailHead"><div><h2>${esc(picker.label)} <small>${esc(picker.fullName)}</small></h2><p>${fmt(picker.units)} MODs ${esc(unitLabel())} | ${fmt(picker.paceRate)} Adjusted LPH | ${pct(picker.pacePerformance)} Pace Score | ${hrs(picker.seconds / 3600)} Hours</p></div><div class="detailActions"><span class="shiftTag ${picker.autoShift.number === '1' ? 'first' : 'second'}">${picker.autoShift.label} | First pick ${timeText(picker.autoShift.firstPick)}</span><button id="detailClose">Close</button></div></header><div class="detailBody"><div class="detailKpis"><div><span>Total Off-Standard</span><b>${formatDuration(picker.offStandard.totalSeconds)}</b></div><div class="approved"><span>Approved</span><b>${formatDuration(picker.offStandard.approvedSeconds)}</b></div><div class="pending"><span>Pending</span><b>${formatDuration(picker.offStandard.pendingSeconds)}</b></div><div class="denied"><span>Denied</span><b>${formatDuration(picker.deniedPenaltySeconds)}</b></div></div><h3>${esc(operationName())} Area Summary</h3><table><thead><tr><th>Area</th><th>Picks</th><th>Adjusted</th><th>Hours</th><th>Rate</th><th>Adjusted LPH</th></tr></thead><tbody>${areaRows}</tbody></table><h3>Complete Activity Timeline</h3><table><thead><tr><th>Start</th><th>End</th><th>Function</th><th>Area</th><th>Units</th><th>Adjusted</th><th>Rate</th><th>Performance</th><th>Status</th></tr></thead><tbody>${activityRows}</tbody></table></div></section>`;
+    doc.body.appendChild(shade);
+    const close = () => { shade.remove(); state.ui.detailOpen = false; };
+    shade.querySelector('#detailClose').onclick = close;
+    shade.onclick = event => { if (event.target === shade) close(); };
+  }
+
+  const DEFAULT_CARD_SIZING = Object.freeze({
+    columns: 4,
+    rows: 4
+  });
+  function normalizeCardSizing(raw = {}) {
+    const columns = Math.min(8, Math.max(1, Math.round(Number(raw.columns) || DEFAULT_CARD_SIZING.columns)));
+    const rows = Math.min(8, Math.max(1, Math.round(Number(raw.rows) || DEFAULT_CARD_SIZING.rows)));
+    return { columns, rows };
+  }
+  function cardSizingCss(sizing = state.cardSizing || DEFAULT_CARD_SIZING) {
+    const grid = normalizeCardSizing(sizing);
+    return `--card-columns:${grid.columns};--card-rows:${grid.rows};`;
+  }
+  function applyCardSizingToDashboard() {
+    if (state.ui?.cards) state.ui.cards.style.cssText = cardSizingCss();
+  }
+  function makeGroupId() {
+    return `group_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  }
+  function normalizeGroupName(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+  }
+  function normalizeGroupAbbreviation(value, fallback = '') {
+    const cleaned = String(value || '').replace(/\s+/g, '').trim().slice(0, 8).toUpperCase();
+    if (cleaned) return cleaned;
+    return String(fallback || '').split(/\s+/).filter(Boolean).map(part => part[0]).join('').slice(0, 4).toUpperCase() || 'GRP';
+  }
+  function normalizeGroupColor(value) {
+    const color = String(value || '').trim();
+    return /^#[0-9a-f]{6}$/i.test(color) ? color.toUpperCase() : '#258FDC';
+  }
+  function readableTextColor(hex) {
+    const value = normalizeGroupColor(hex).slice(1);
+    const r = parseInt(value.slice(0, 2), 16), g = parseInt(value.slice(2, 4), 16), b = parseInt(value.slice(4, 6), 16);
+    return (r * 299 + g * 587 + b * 114) / 1000 >= 150 ? '#06131D' : '#FFFFFF';
+  }
+  function normalizeUserGroups(rawGroups = []) {
+    const groups = [];
+    const usedIds = new Set();
+    const usedNames = new Set();
+    for (const item of Array.isArray(rawGroups) ? rawGroups : []) {
+      const name = normalizeGroupName(typeof item === 'string' ? item : item?.name);
+      if (!name || usedNames.has(name.toLowerCase())) continue;
+      let id = String(typeof item === 'string' ? '' : item?.id || '').trim();
+      if (!id || usedIds.has(id)) id = makeGroupId();
+      const abbreviation = normalizeGroupAbbreviation(typeof item === 'string' ? '' : item?.abbreviation, name);
+      const color = normalizeGroupColor(typeof item === 'string' ? '' : item?.color);
+      groups.push({ id, name, abbreviation, color });
+      usedIds.add(id);
+      usedNames.add(name.toLowerCase());
+    }
+    return groups;
+  }
+  function normalizeGroupAssignments(rawAssignments = {}, rawGroups = state.userGroups || []) {
+    const groups = normalizeUserGroups(rawGroups);
+    const validIds = new Set(groups.map(group => group.id));
+    const assignments = {};
+    if (rawAssignments && typeof rawAssignments === 'object' && !Array.isArray(rawAssignments)) {
+      for (const [username, groupId] of Object.entries(rawAssignments)) {
+        const normalizedUsername = String(username || '').trim().toLowerCase();
+        const normalizedGroupId = String(groupId || '').trim();
+        if (normalizedUsername && validIds.has(normalizedGroupId)) assignments[normalizedUsername] = normalizedGroupId;
+      }
+    }
+    return assignments;
+  }
+  function groupForUsername(username) {
+    const groupId = state.userGroupAssignments[String(username || '').trim().toLowerCase()];
+    return state.userGroups.find(group => group.id === groupId) || null;
+  }
+  function applyGroupAssignment(username, groupId) {
+    const key = String(username || '').trim().toLowerCase();
+    if (!key) return;
+    if (groupId && state.userGroups.some(group => group.id === groupId)) state.userGroupAssignments[key] = groupId;
+    else delete state.userGroupAssignments[key];
+    saveSettings();
+  }
+  const DEFAULT_CARD_TEXT = Object.freeze({ username:24, fullName:12, lineTotal:29, status:12, zone:21, metricLabel:14, metricValue:17, performance:22, offHeader:12, offValue:16, offTileLabel:9, offTileValue:15 });
+  const DEFAULT_SIDEBAR_TEXT = Object.freeze({ heading:18, rankingName:15, rankingValue:16, zoneName:22, zoneNeed:18, zoneDetails:12, pickerNames:11 });
+  const DEFAULT_TICKER_ITEMS = Object.freeze({ firstPerf:true, secondPerf:true, active:true, top1:true, top2:true, top3:true, firstPicks:true, secondPicks:true });
+  function boundedObject(raw, defaults, min=7, max=42) { const out={}; for(const [key,value] of Object.entries(defaults)){const v=Math.round(Number(raw?.[key]));out[key]=Number.isFinite(v)?Math.min(max,Math.max(min,v)):value;} return out; }
+  function normalizeTickerItems(raw={}) { const out={}; for(const [key,value] of Object.entries(DEFAULT_TICKER_ITEMS)) out[key]=raw[key]===undefined?value:raw[key]!==false; return out; }
+  function calculateResponsiveCardScale() {
+    if(!state.autoFitCards||!state.ui?.cards)return 1;
+    const cards=state.ui.cards,cols=Math.max(1,state.cardSizing?.columns||4),rows=Math.max(1,state.cardSizing?.rows||4),style=getComputedStyle(cards);
+    const gx=parseFloat(style.columnGap)||7,gy=parseFloat(style.rowGap)||7;
+    const cellWidth=Math.max(1,(cards.clientWidth-gx*(cols-1))/cols),cellHeight=Math.max(1,(cards.clientHeight-gy*(rows-1))/rows);
+    return Math.min(1.55,Math.max(.48,Math.min(cellWidth/350,cellHeight/235)));
+  }
+  function setCardScale(scale) {
+    if(!state.frame?.contentDocument)return;
+    const root=state.frame.contentDocument.documentElement,c=state.cardText||DEFAULT_CARD_TEXT;
+    state.cardScale=scale;
+    const vars={username:c.username,fullname:c.fullName,lineTotal:c.lineTotal,status:c.status,zone:c.zone,metricLabel:c.metricLabel,metricValue:c.metricValue,performance:c.performance,offHeader:c.offHeader,offValue:c.offValue,offTileLabel:c.offTileLabel,offTileValue:c.offTileValue};
+    for(const [key,value] of Object.entries(vars))root.style.setProperty(`--${key}`,`${Math.max(6,value*scale).toFixed(2)}px`);
+    root.style.setProperty('--card-scale',scale.toFixed(3));root.style.setProperty('--card-pad-y',`${Math.max(3,11*scale).toFixed(2)}px`);root.style.setProperty('--card-pad-x',`${Math.max(4,13*scale).toFixed(2)}px`);root.style.setProperty('--card-inner-gap',`${Math.max(2,8*scale).toFixed(2)}px`);root.style.setProperty('--card-section-space',`${Math.max(1,5*scale).toFixed(2)}px`);root.style.setProperty('--card-radius',`${Math.max(4,7*scale).toFixed(2)}px`);
+  }
+  function applyVisualSizing() {
+    if(!state.frame?.contentDocument)return;
+    const root=state.frame.contentDocument.documentElement,layout=state.frame.contentDocument.querySelector('.layout');
+    const width=Math.min(40,Math.max(15,Number(state.sidebarWidthPercent)||22));root.style.setProperty('--sidebar-width-percent',`${width}%`);if(layout)layout.style.gridTemplateColumns=`minmax(0,1fr) minmax(280px,${width}%)`;
+    setCardScale(calculateResponsiveCardScale());
+    const b=state.sidebarText||DEFAULT_SIDEBAR_TEXT,side=state.frame.contentDocument.querySelector('.side'),ss=state.autoFitCards?Math.min(1.25,Math.max(.62,(side?.clientWidth||390)/430)):1;
+    const vars={sideHeading:b.heading,rankingName:b.rankingName,rankingValue:b.rankingValue,zoneName:b.zoneName,zoneNeed:b.zoneNeed,zoneDetails:b.zoneDetails,pickerNames:b.pickerNames};for(const [key,value] of Object.entries(vars))root.style.setProperty(`--${key}`,`${Math.max(8,value*ss).toFixed(2)}px`);root.style.setProperty('--sidebar-scale',ss.toFixed(3));
+  }
+  function fitRenderedCardsToHeight(){if(!state.autoFitCards||!state.ui?.cards)return;const cards=[...state.ui.cards.querySelectorAll('.pickerCard:not(.previewPickerCard)')];if(!cards.length)return;let scale=state.cardScale||1;for(let i=0;i<5;i++){const worst=cards.reduce((m,c)=>Math.max(m,c.scrollHeight/Math.max(1,c.clientHeight)),1);if(worst<=1.005)break;scale=Math.max(.42,scale/worst*.97);setCardScale(scale);}}
+  function restartResponsiveSizingObserver(){state.resizeObserver?.disconnect?.();state.resizeObserver=null;if(!state.ui?.cards)return;let pending=false;const resize=()=>{if(pending)return;pending=true;requestAnimationFrame(()=>{pending=false;applyVisualSizing();requestAnimationFrame(fitRenderedCardsToHeight);});};if(typeof ResizeObserver==='function'){state.resizeObserver=new ResizeObserver(resize);state.resizeObserver.observe(state.ui.cards);}resize();}
+  function normalizeZonePaceOverrides(raw = {}) {
+    const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const out = { 'ZONE 106': 100, 'WA35': 100 };
+    for (const [area, rate] of Object.entries(source)) {
+      const key = String(area || '').trim().replace(/\s+/g, ' ').toUpperCase();
+      const value = Number(rate);
+      if ((/^ZONE\s+\d{3}$/.test(key) || key === 'WA35') && Number.isFinite(value) && value > 0 && value <= 1000) out[key] = value;
+      else if ((/^ZONE\s+\d{3}$/.test(key) || key === 'WA35') && (rate === '' || rate === null || rate === false)) delete out[key];
+    }
+    return out;
+  }
+  function normalizeSettings(raw = {}) {
+    return {
+      excludedUsernames: [...new Set((raw.excludedUsernames || raw.excludedEmployeeIds || []).map(value => String(value).trim()).filter(Boolean))],
+      minimumUnits: Math.max(0, Math.floor(Number(raw.minimumUnits) || 0)),
+      sort: ['name', 'units', 'rate', 'performance', 'recent'].includes(raw.sort) ? raw.sort : 'name',
+      cardSizing: normalizeCardSizing(raw.cardSizing || {}),
+      autoFitCards: raw.autoFitCards !== false,
+      sidebarWidthPercent: Math.min(40,Math.max(15,Number(raw.sidebarWidthPercent)||22)),
+      conveyorBaselinePercent: Math.min(200,Math.max(1,Number(raw.conveyorBaselinePercent)||45.24)),
+      autoRotate: raw.autoRotate !== false,
+      pageRotateSeconds: Math.min(300, Math.max(3, Math.round(Number(raw.pageRotateSeconds) || 12))),
+      refreshSeconds: Math.min(300, Math.max(10, Math.round(Number(raw.refreshSeconds) || 30))),
+      showZones: raw.showZones !== false,
+      rankingMode: ['minutes','hours','today'].includes(raw.rankingMode) ? raw.rankingMode : 'minutes',
+      rankingAmount: Math.min(raw.rankingMode === 'hours' ? 24 : 1440, Math.max(1, Math.round(Number(raw.rankingAmount) || 60))),
+      rankingPeople: Math.min(100, Math.max(1, Math.round(Number(raw.rankingPeople) || 6))),
+      tickerItems: normalizeTickerItems(raw.tickerItems || {}),
+      cardText: boundedObject(raw.cardText, DEFAULT_CARD_TEXT),
+      sidebarText: boundedObject(raw.sidebarText, DEFAULT_SIDEBAR_TEXT),
+      zonePaceOverrides: normalizeZonePaceOverrides(raw.zonePaceOverrides),
+      userGroups: normalizeUserGroups(raw.userGroups || []),
+      userGroupAssignments: normalizeGroupAssignments(raw.userGroupAssignments || {}, raw.userGroups || [])
+    };
+  }
+  function currentSettings() {
+    return normalizeSettings({
+      excludedUsernames: [...state.excludedUsernames],
+      minimumUnits: state.minimumUnits,
+      sort: state.sort,
+      cardSizing: normalizeCardSizing(state.cardSizing || {}),
+      autoFitCards: state.autoFitCards,
+      sidebarWidthPercent: state.sidebarWidthPercent,
+      conveyorBaselinePercent: state.conveyorBaselinePercent,
+      autoRotate: state.autoRotate,
+      pageRotateSeconds: state.pageRotateSeconds,
+      refreshSeconds: state.refreshSeconds,
+      showZones: state.showZones,
+      rankingMode: state.rankingMode, rankingAmount: state.rankingAmount, rankingPeople: state.rankingPeople, tickerItems: state.tickerItems,
+      cardText: state.cardText, sidebarText: state.sidebarText, zonePaceOverrides: state.zonePaceOverrides,
+      userGroups: normalizeUserGroups(state.userGroups),
+      userGroupAssignments: normalizeGroupAssignments(state.userGroupAssignments, state.userGroups)
+    });
+  }
+  function applySettings(raw) {
+    const settings = normalizeSettings(raw);
+    state.excludedUsernames = new Set(settings.excludedUsernames);
+    state.minimumUnits = settings.minimumUnits;
+    state.sort = settings.sort;
+    state.cardSizing = settings.cardSizing;
+    state.autoFitCards=settings.autoFitCards; state.sidebarWidthPercent=settings.sidebarWidthPercent; state.conveyorBaselinePercent=settings.conveyorBaselinePercent;
+    state.autoRotate = settings.autoRotate;
+    state.pageRotateSeconds = settings.pageRotateSeconds;
+    state.refreshSeconds = settings.refreshSeconds;
+    state.showZones = settings.showZones;
+    state.rankingMode=settings.rankingMode; state.rankingAmount=settings.rankingAmount; state.rankingPeople=settings.rankingPeople; state.tickerItems=settings.tickerItems; state.cardText=settings.cardText; state.sidebarText=settings.sidebarText; state.zonePaceOverrides=settings.zonePaceOverrides;
+    state.userGroups = settings.userGroups;
+    state.userGroupAssignments = settings.userGroupAssignments;
+    return settings;
+  }
+  function loadSettings() {
+    try {
+      const stored = localStorage.getItem(CONFIG.settingsKey);
+      const raw = stored ? JSON.parse(stored) : {};
+      if (!raw.excludedUsernames && raw.excludedEmployeeIds) raw.excludedUsernames = raw.excludedEmployeeIds;
+      applySettings(raw);
+    } catch (error) {
+      console.error('[Vision Dashboard] Could not load settings:', error);
+      applySettings({});
+    }
+  }
+  function saveSettings() {
+    const settings = currentSettings();
+    localStorage.setItem(CONFIG.settingsKey, JSON.stringify(settings));
+    const verification = JSON.parse(localStorage.getItem(CONFIG.settingsKey) || '{}');
+    if (JSON.stringify(normalizeSettings(verification)) !== JSON.stringify(settings)) {
+      throw new Error('Browser storage verification failed.');
+    }
+    return settings;
+  }
+  function parseUsernames(value) {
+    return [...new Set(String(value || '').split(/[\s,;]+/).map(item => item.trim()).filter(Boolean))];
+  }
+  function downloadSettings() {
+    const payload = {
+      format: 'VisionLiveBreakpackDashboardSettings',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      settings: currentSettings()
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'Vision_Live_Breakpack_Dashboard_Settings.json';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  async function importSettingsFile(file) {
+    const parsed = JSON.parse(await file.text());
+    const imported = applySettings(parsed.settings || parsed);
+    saveSettings();
+    if (state.data) processData(state.data);
+    render();
+    return imported;
+  }
+  function openSettings() {
+    if(!state.frame||!state.ui)return;state.ui.detailOpen=true;const doc=state.frame.contentDocument;
+    const shade=doc.createElement('div');shade.className='settingsShade';
+    shade.innerHTML=`<section class="settingsBox"><header class="settingsHead"><div><h2>Dashboard Settings</h2><p>Settings are saved in this browser.</p></div><button id="settingsClose">Close</button></header><div class="settingsLayout"><nav class="settingsTabs"><button type="button" class="active" data-tab="excluded">Excluded Usernames</button><button type="button" data-tab="threshold">Minimum Threshold</button><button type="button" data-tab="sizing">Card Layout</button><button type="button" data-tab="transfer">Export / Import</button><button type="button" data-tab="display">Display</button><button type="button" data-tab="ticker">Ticker</button><button type="button" data-tab="kpis">KPI Settings</button><button type="button" data-tab="zonepace">Zone LPH Overrides</button><button type="button" data-tab="ranking">Ranking</button><button type="button" data-tab="refresh">Refresh</button></nav><main class="settingsContent"><section data-panel="excluded"><h3>Excluded Usernames</h3><p>Enter Vision usernames exactly as displayed on the cards, such as TrandizD or JovanaB. Usernames are matched without regard to uppercase or lowercase. Use commas, spaces, or new lines.</p><textarea id="excludedUsernames" placeholder="TrandizD\nJovanaB">${esc([...state.excludedUsernames].join('\n'))}</textarea></section><section data-panel="threshold" hidden><h3>Minimum Threshold</h3><p>Hide picker cards until the associate reaches this many MODs lines. Default is 0.</p><label class="fieldLabel">Minimum MODs lines<input id="minimumUnits" type="number" min="0" step="1" value="${state.minimumUnits}"></label></section><section data-panel="sizing" hidden><h3>Card Layout & Text</h3><div class="innerTabs"><button type="button" class="active" data-inner="grid">Grid</button><button type="button" data-inner="cardtext">Card Text</button><button type="button" data-inner="sidetext">Sidebar Text</button></div><div data-inner-panel="grid"><div class="layoutSettings"><label>Columns per page<input id="layoutColumns" type="number" min="1" max="8" value="${state.cardSizing?.columns||4}"></label><label>Rows per page<input id="layoutRows" type="number" min="1" max="8" value="${state.cardSizing?.rows||4}"></label><label>Right Sidebar Width %<input id="sidebarWidthPercent" type="number" min="15" max="40" value="${state.sidebarWidthPercent}"></label></div><div class="timingSettings compactSettings"><label class="toggleSetting"><span><b>Auto-Fit Cards to Screen</b><small>Scales card text, spacing, and sidebar content using the actual row, column, and screen dimensions.</small></span><input id="autoFitCards" type="checkbox" ${state.autoFitCards?'checked':''}></label></div></div><div data-inner-panel="cardtext" hidden><div class="cardTextWorkspace"><div id="cardTextControls" class="fontControls"></div><div class="liveCardPreviewWrap"><div class="previewLabel">LIVE CARD PREVIEW</div><article id="liveCardPreview" class="pickerCard historical previewPickerCard"><div class="cardHead"><div class="identity"><div class="identityTop"><h2>JordanL</h2><span class="shiftTag first">First Shift</span></div><small>Jordan Ladell</small></div><div></div><div class="heroValue" title="Weighted Lines">534</div></div><div class="areaRow"><div class="area">ZONE 414</div><div class="zoneBreakStatus lunch">ON LUNCH</div></div><div class="metrics primaryMetrics"><div class="performanceMetric"><span>ADJUSTED LPH</span><b class="good">100</b></div><div><span>WORK HOURS</span><b>5.33</b></div><div><span>LAST ACTIVITY</span><b>02:28 PM</b></div></div><div class="offStandardBlock"><div class="offTitle"><span>OFF-STANDARD</span><b>55m</b></div><div class="offGrid"><div class="approved"><span>APPROVED</span><b>53m</b></div><div class="pending"><span>PENDING</span><b>0m</b></div><div class="denied"><span>DENIED</span><b>2m</b></div></div></div></article></div></div></div><div data-inner-panel="sidetext" hidden><div class="sidebarTextWorkspace"><div id="sidebarTextControls" class="fontControls"></div><div class="liveSidebarPreviewWrap"><div class="previewLabel">LIVE SIDEBAR PREVIEW</div><aside id="liveSidebarPreview" class="side previewSidebar"><section class="panel rankingPanel"><h3>LAST 60 MINUTES</h3><div class="rankSub">ADJUSTED LPH | MODs + OVERRIDES</div><div class="rank"><div><span>1</span><b>JordanL</b><strong>108%</strong></div><div><span>2</span><b>JovanaB</b><strong>104%</strong></div><div><span>3</span><b>TrandizD</b><strong>101%</strong></div></div></section><section class="panel zonePanel"><div class="zoneHead"><h3>ZONES NEEDING PICKERS</h3><small>Updated 02:28 PM</small></div><div class="zones"><div class="zoneNeed"><div><b>22A1</b><strong>ADD 2 PICKERS</strong></div><small>387 picks | 59 cartons | Staffed 1 of 3</small><span class="zonePickerNames">Current: JordanL</span></div><div class="zoneNeed"><div><b>21A2</b><strong>ADD 1 PICKER</strong></div><small>264 picks | 54 cartons | Staffed 1 of 2</small><span class="zonePickerNames">Current: JovanaB</span></div></div></section></aside></div></div></div></section><section data-panel="transfer" hidden><h3>Export / Import Settings</h3><p>Move all dashboard settings between warehouse PCs using one JSON file.</p><div class="transferActions"><button id="exportSettings">Export All Settings</button><label class="importButton">Import Settings<input id="importSettings" type="file" accept=".json,application/json"></label></div><div id="transferMsg" class="settingNote">Import replaces the current settings on this PC.</div></section><section data-panel="display" hidden><h3>Display</h3><div class="settingNote">Production scope: Carton Picking in numbered MODs zones plus WA35. Zone LPH Overrides can assign flat adjusted pace values while keeping picks and work hours included.</div><div class="timingSettings"><label class="toggleSetting"><span><b>Show Zone Recommendations</b><small>Load Decision Point zone staffing recommendations.</small></span><input id="showZones" type="checkbox" ${state.showZones?'checked':''}></label></div></section><section data-panel="ticker" hidden><h3>Top Ticker</h3><p>Choose which items appear in the scrolling ticker.</p><div id="tickerToggles" class="toggleGrid"></div></section><section data-panel="kpis" hidden><h3>Operations KPI Settings</h3><p>Set the target share of MOD cartons that should be physically in the zones. A lower in-zone count with a high MOD carton count lowers efficiency. This target is treated as 100% conveyor efficiency.</p><label class="fieldLabel">In-Zone Baseline for 100% Efficiency<input id="conveyorBaselinePercent" type="number" min="1" max="200" step="1" value="${state.conveyorBaselinePercent}"><small>Default 45.24%, calibrated so 475 cartons in zones with 1,050 MODS cartons equals 100% efficiency. Efficiency = (In-Zone Cartons ÷ MODS Cartons) ÷ Baseline × 100.</small></label><div class="settingNote">In-Zone Cartons includes In Zone + Inactive from Zone Management. MODS Cartons comes from the Mod total on Hub Status. Lines Remaining comes from Total Available Lines on Unpicked Lines.</div></section><section data-panel="zonepace" hidden><h3>Zone LPH Overrides</h3><p>Detected Carton Picking areas are listed automatically. Leave a rate blank to use Vision's calculated pace, or enter a flat adjusted pace for all time worked in that area.</p><div class="settingNote">ZONE 106 and WA35 default to a flat LPH of 100. Picks and work hours remain included. Mixed-zone associates receive a work-hour-weighted blended pace.</div><div id="zonePaceOverrides" class="zoneOverrideGrid"></div></section><section data-panel="ranking" hidden><h3>Productivity Ranking</h3><p>Rankings use MODs Carton Picking records plus WA35. Saved Zone LPH Overrides are applied to the selected ranking window.</p><div class="rankingSettings"><label>Time window<select id="rankingMode"><option value="minutes">Last X Minutes</option><option value="hours">Last X Hours</option><option value="today">Today Overall</option></select></label><label id="rankingAmountLabel">Amount<input id="rankingAmount" type="number" min="1" max="1440" value="${state.rankingAmount}"></label><label>People to show<input id="rankingPeople" type="number" min="1" max="100" value="${state.rankingPeople}"></label></div><div class="settingNote">Time window, amount, and people to show are saved in this browser and included in Settings export/import.</div></section><section data-panel="refresh" hidden><h3>Timing & Rotation</h3><p>Control how often the dashboard changes pages and retrieves fresh Vision data.</p><div class="timingSettings"><label class="toggleSetting"><span><b>Automatic Page Rotation</b><small>Automatically move to the next picker page.</small></span><input id="autoRotate" type="checkbox" ${state.autoRotate ? 'checked' : ''}></label><label><span><b>Seconds Before Page Switch</b><small>How long each picker page remains visible.</small></span><input id="pageRotateSeconds" type="number" min="3" max="300" step="1" value="${state.pageRotateSeconds}"></label><label><span><b>Vision Refresh Interval</b><small>How often new productivity data is requested.</small></span><div class="numberWithUnit"><input id="refreshSeconds" type="number" min="10" max="300" step="1" value="${state.refreshSeconds}"><em>seconds</em></div></label><div class="settingNote">Page rotation pauses while Picker Details or Settings is open. Changes apply after Save Settings.</div></div></section></main></div><footer class="settingsFoot"><span id="settingsMsg"></span><button id="settingsCancel">Cancel</button><button id="settingsSave" class="save">Save Settings</button></footer></section>`;
+    doc.body.appendChild(shade);
+    const draftCardText={...(state.cardText||DEFAULT_CARD_TEXT)}, draftSidebarText={...(state.sidebarText||DEFAULT_SIDEBAR_TEXT)}, draftTicker={...(state.tickerItems||DEFAULT_TICKER_ITEMS)};
+    const draftZoneOverrides={...(state.zonePaceOverrides||{})};
+    const zoneOverrideHost=shade.querySelector('#zonePaceOverrides');
+    const zoneAreas=[...new Set([...(state.detectedPaceAreas||[]),...Object.keys(draftZoneOverrides),'ZONE 106','WA35'])].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+    zoneOverrideHost.innerHTML=zoneAreas.map(area=>`<label><span><b>${esc(area)}</b><small>${draftZoneOverrides[area]!==undefined?'Flat override active':'Using calculated Vision pace'}</small></span><input data-zone-pace="${esc(area)}" type="number" min="1" max="1000" step="0.01" placeholder="Calculated" value="${draftZoneOverrides[area]??''}"></label>`).join('');
+    zoneOverrideHost.querySelectorAll('[data-zone-pace]').forEach(input=>input.oninput=()=>{const area=input.dataset.zonePace,value=input.value.trim();if(value==='')delete draftZoneOverrides[area];else{const rate=Number(value);if(Number.isFinite(rate)&&rate>0)draftZoneOverrides[area]=rate;}const note=input.closest('label')?.querySelector('small');if(note)note.textContent=value===''?'Using calculated Vision pace':'Flat override active';});
+    const buildFontControls=(host,values,labels,onChange)=>{
+      host.innerHTML=Object.entries(labels).map(([key,label])=>`<label>${label}<input data-font="${key}" type="number" min="7" max="42" value="${values[key]}"><span>px</span></label>`).join('');
+      host.querySelectorAll('[data-font]').forEach(input=>input.oninput=()=>{
+        values[input.dataset.font]=Math.min(42,Math.max(7,Math.round(Number(input.value)||7)));
+        onChange?.();
+      });
+    };
+    const liveCardPreview=shade.querySelector('#liveCardPreview');
+    const updateLiveCardPreview=()=>{
+      if(!liveCardPreview)return;
+      const variables={username:draftCardText.username,fullname:draftCardText.fullName,lineTotal:draftCardText.lineTotal,status:draftCardText.status,zone:draftCardText.zone,metricLabel:draftCardText.metricLabel,metricValue:draftCardText.metricValue,performance:draftCardText.performance,offHeader:draftCardText.offHeader,offValue:draftCardText.offValue,offTileLabel:draftCardText.offTileLabel,offTileValue:draftCardText.offTileValue};
+      for(const [key,value] of Object.entries(variables))liveCardPreview.style.setProperty(`--${key}`,`${value}px`);
+    };
+    buildFontControls(shade.querySelector('#cardTextControls'),draftCardText,{username:'Username',fullName:'Full Name',lineTotal:'Weighted Lines Total',status:'Status',zone:'Zone',metricLabel:'Metric Labels',metricValue:'Metric Values',performance:'Adjusted LPH',offHeader:'Off-Standard Header',offValue:'Off-Standard Total',offTileLabel:'Off-Standard Tile Labels',offTileValue:'Off-Standard Tile Values'},updateLiveCardPreview);
+    const liveSidebarPreview=shade.querySelector('#liveSidebarPreview');
+    const updateLiveSidebarPreview=()=>{
+      if(!liveSidebarPreview)return;
+      const variables={sideHeading:draftSidebarText.heading,rankingName:draftSidebarText.rankingName,rankingValue:draftSidebarText.rankingValue,zoneName:draftSidebarText.zoneName,zoneNeed:draftSidebarText.zoneNeed,zoneDetails:draftSidebarText.zoneDetails,pickerNames:draftSidebarText.pickerNames};
+      for(const [key,value] of Object.entries(variables))liveSidebarPreview.style.setProperty(`--${key}`,`${value}px`);
+    };
+    buildFontControls(shade.querySelector('#sidebarTextControls'),draftSidebarText,{heading:'Panel Headings',rankingName:'Ranking Names',rankingValue:'Ranking Percent',zoneName:'Zone Name',zoneNeed:'Pickers Needed',zoneDetails:'Zone Details',pickerNames:'Picker Names'},updateLiveSidebarPreview);
+    updateLiveCardPreview();
+    updateLiveSidebarPreview();
+    const tickerLabels={firstPerf:'1st Shift Avg Performance',secondPerf:'2nd Shift Avg Performance',active:'Total Active Pickers',top1:'Top Performance',top2:'2nd Performance',top3:'3rd Performance',firstPicks:'1st Shift Picks',secondPicks:'2nd Shift Picks'};
+    shade.querySelector('#tickerToggles').innerHTML=Object.entries(tickerLabels).map(([key,label])=>`<label><input data-ticker="${key}" type="checkbox" ${draftTicker[key]?'checked':''}>${label}</label>`).join('');
+    shade.querySelectorAll('[data-inner]').forEach(btn=>btn.onclick=()=>{shade.querySelectorAll('[data-inner]').forEach(x=>x.classList.toggle('active',x===btn));shade.querySelectorAll('[data-inner-panel]').forEach(x=>x.hidden=x.dataset.innerPanel!==btn.dataset.inner);});
+    shade.querySelector('#rankingMode').value=state.rankingMode;
+    const syncRankingSettings=()=>{
+      const mode=shade.querySelector('#rankingMode').value;
+      const amountInput=shade.querySelector('#rankingAmount');
+      shade.querySelector('#rankingAmountLabel').hidden=mode==='today';
+      amountInput.max=mode==='hours'?'24':'1440';
+      const previewHeading=shade.querySelector('#liveSidebarPreview .rankingPanel h3');
+      if(previewHeading){
+        const amount=Math.max(1,Math.round(Number(amountInput.value)||1));
+        previewHeading.textContent=mode==='today'?'TODAY OVERALL':`LAST ${amount} ${mode==='hours'?(amount===1?'HOUR':'HOURS'):(amount===1?'MINUTE':'MINUTES')}`;
+      }
+    };
+    shade.querySelector('#rankingMode').onchange=syncRankingSettings;
+    shade.querySelector('#rankingAmount').oninput=syncRankingSettings;
+    syncRankingSettings();
+    const draftSizing=normalizeCardSizing(state.cardSizing||{});
+    const columnInput=shade.querySelector('#layoutColumns');
+    const rowInput=shade.querySelector('#layoutRows');
+    const syncGridInputs=()=>{
+      draftSizing.columns=Math.min(8,Math.max(1,Math.round(Number(columnInput?.value)||4)));
+      draftSizing.rows=Math.min(8,Math.max(1,Math.round(Number(rowInput?.value)||4)));
+      if(columnInput)columnInput.value=draftSizing.columns;
+      if(rowInput)rowInput.value=draftSizing.rows;
+    };
+    if(columnInput)columnInput.oninput=syncGridInputs;
+    if(rowInput)rowInput.oninput=syncGridInputs;
+    syncGridInputs();
+    shade.querySelectorAll('.settingsTabs [data-tab]').forEach(button=>{
+      button.addEventListener('click',event=>{
+        event.preventDefault();
+        const tab=button.dataset.tab;
+        shade.querySelectorAll('.settingsTabs [data-tab]').forEach(item=>item.classList.toggle('active',item===button));
+        shade.querySelectorAll('.settingsContent [data-panel]').forEach(panel=>{panel.hidden=panel.dataset.panel!==tab;});
+      });
+    });
+    const close=()=>{shade.remove();state.ui.detailOpen=false;};shade.querySelector('#settingsClose').onclick=close;shade.querySelector('#settingsCancel').onclick=close;
+    shade.querySelector('#exportSettings').onclick=downloadSettings;
+    shade.querySelector('#importSettings').onchange=async e=>{try{const f=e.target.files?.[0];if(!f)return;const imported=await importSettingsFile(f);if(state.ui?.sort)state.ui.sort.value=state.sort;shade.querySelector('#excludedUsernames').value=imported.excludedUsernames.join('\n');shade.querySelector('#minimumUnits').value=imported.minimumUnits;if(shade.querySelector('#autoFitCards'))shade.querySelector('#autoFitCards').checked=imported.autoFitCards;if(shade.querySelector('#sidebarWidthPercent'))shade.querySelector('#sidebarWidthPercent').value=imported.sidebarWidthPercent;if(shade.querySelector('#conveyorBaselinePercent'))shade.querySelector('#conveyorBaselinePercent').value=imported.conveyorBaselinePercent;shade.querySelector('#autoRotate').checked=imported.autoRotate;shade.querySelector('#pageRotateSeconds').value=imported.pageRotateSeconds;shade.querySelector('#refreshSeconds').value=imported.refreshSeconds;if(shade.querySelector('#showZones'))shade.querySelector('#showZones').checked=imported.showZones;if(shade.querySelector('#rankingMode'))shade.querySelector('#rankingMode').value=imported.rankingMode;if(shade.querySelector('#rankingAmount'))shade.querySelector('#rankingAmount').value=imported.rankingAmount;if(shade.querySelector('#rankingPeople'))shade.querySelector('#rankingPeople').value=imported.rankingPeople;Object.assign(draftZoneOverrides,imported.zonePaceOverrides||{});syncRankingSettings();restartDashboardTimers();Object.assign(draftSizing,imported.cardSizing||DEFAULT_CARD_SIZING);if(columnInput)columnInput.value=draftSizing.columns;if(rowInput)rowInput.value=draftSizing.rows;syncGridInputs();shade.querySelector('#transferMsg').textContent=`Imported ${imported.excludedUsernames.length} excluded username(s) minimum ${imported.minimumUnits} lines, ${imported.pageRotateSeconds}s page rotation, and ${imported.refreshSeconds}s refresh from ${f.name}.`;}catch(err){shade.querySelector('#transferMsg').textContent=`Import failed: ${err.message}`;}e.target.value='';};
+    shade.querySelector('#settingsSave').onclick=()=>{
+      const message=shade.querySelector('#settingsMsg');
+      try {
+        applySettings({
+          excludedUsernames: parseUsernames(shade.querySelector('#excludedUsernames').value),
+          minimumUnits: shade.querySelector('#minimumUnits').value,
+          sort: state.sort,
+          cardSizing: draftSizing,
+          autoFitCards: shade.querySelector('#autoFitCards')?.checked ?? state.autoFitCards,
+          sidebarWidthPercent: shade.querySelector('#sidebarWidthPercent')?.value ?? state.sidebarWidthPercent,
+          conveyorBaselinePercent: shade.querySelector('#conveyorBaselinePercent')?.value ?? state.conveyorBaselinePercent,
+          autoRotate: shade.querySelector('#autoRotate')?.checked ?? state.autoRotate,
+          pageRotateSeconds: shade.querySelector('#pageRotateSeconds')?.value ?? state.pageRotateSeconds,
+          refreshSeconds: shade.querySelector('#refreshSeconds')?.value ?? state.refreshSeconds,
+          showZones: shade.querySelector('#showZones')?.checked ?? state.showZones,
+          rankingMode: shade.querySelector('#rankingMode')?.value ?? state.rankingMode,
+          rankingAmount: shade.querySelector('#rankingAmount')?.value ?? state.rankingAmount,
+          rankingPeople: shade.querySelector('#rankingPeople')?.value ?? state.rankingPeople,
+          tickerItems: Object.fromEntries([...shade.querySelectorAll('[data-ticker]')].map(x=>[x.dataset.ticker,x.checked])),
+          cardText: draftCardText, sidebarText: draftSidebarText, zonePaceOverrides: draftZoneOverrides
+        });
+        const saved=saveSettings();
+        if(state.data)processData(state.data);
+        restartDashboardTimers();
+        restartZoneTimer();
+        applyVisualSizing();
+        render();
+        shade.querySelector('#excludedUsernames').value=saved.excludedUsernames.join('\n');
+        shade.querySelector('#minimumUnits').value=saved.minimumUnits;
+        message.className='successMsg';
+        message.textContent=`Saved: ranking ${saved.rankingMode === 'today' ? 'Today Overall' : saved.rankingAmount + ' ' + saved.rankingMode}, showing ${saved.rankingPeople} people.`;
+      } catch(error) {
+        message.className='errorMsg';
+        message.textContent=`Save failed: ${error.message}`;
+      }
+    };
+  }
+  function dashboardHtml() {
+    return `<!doctype html><html><head><meta charset="utf-8"><style>
+      *{box-sizing:border-box} body{margin:0;background:#06131d;color:#edf8ff;font-family:Arial,sans-serif;overflow:hidden}
+      .top{height:58px;border:1px solid #244b61;background:#061824;display:flex;align-items:center;overflow:hidden;box-shadow:inset 0 -1px 0 rgba(76,178,232,.12)}
+      .ticker{width:100%;overflow:hidden;white-space:nowrap}.tickerTrack{display:flex;width:max-content;will-change:transform;animation:tickerScroll 54s linear infinite}.tickerSet{display:flex;align-items:center;flex-shrink:0}.tickerItem{height:56px;display:flex;align-items:center;gap:10px;padding:0 30px;border-right:1px solid #244b61;color:#9ddfff;font-size:18px;font-weight:900;text-shadow:0 0 8px rgba(95,194,245,.14)}.tickerItem b{font-weight:900}.tickerItem strong{color:#5df29f;font-size:20px;font-weight:900}.ticker:hover .tickerTrack{animation-play-state:paused}@keyframes tickerScroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+      .layout{height:calc(100vh - 98px);display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,var(--sidebar-width-percent,22%));gap:8px;padding:8px}.cards{display:grid;grid-template-columns:repeat(var(--card-columns,4),minmax(0,1fr));grid-template-rows:repeat(var(--card-rows,4),minmax(0,1fr));gap:7px;min-width:0;min-height:0;overflow:hidden}
+      .pickerCard{position:relative;display:flex;flex-direction:column;background:#0b202d;border:2px solid #28516a;border-left:6px solid #258fdc;border-radius:var(--card-radius,7px);padding:var(--card-pad-y,11px) var(--card-pad-x,13px);overflow:hidden;cursor:pointer;opacity:1;transition:transform .15s,border-color .15s,box-shadow .15s}.pickerCard:hover{transform:scale(1.015);border-color:#58bcea}.pickerCard.todayActive{border-color:#26a9ef;border-left-color:#47d7ff;box-shadow:inset 0 0 22px rgba(38,169,239,.15),0 0 9px rgba(38,169,239,.35)}.pickerCard.todayInactive{border-color:#3c5868;border-left-color:#647986;box-shadow:none}.pickerCard.historical{border-color:#28516a;border-left-color:#258fdc;box-shadow:none}.cardHead{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(95px,auto);align-items:start;gap:var(--card-inner-gap,8px)}.identity{min-width:0}.identityTop{display:flex;align-items:center;gap:8px;min-width:0}.identityTop h2{min-width:0;overflow:hidden;text-overflow:ellipsis}.identityTop .shiftTag{flex:0 0 auto}.breakStatus{align-self:start;margin-top:2px;padding:7px 12px;border-radius:6px;background:#6a4310;border:1px solid #f0a62b;color:#ffd27a;font-size:17px;font-weight:900;white-space:nowrap;box-shadow:0 0 14px rgba(240,166,43,.40)}.cardHead h2{font-size:var(--username,24px);line-height:1;margin:0}.cardHead small{display:block;color:#82b9d4;font-size:var(--fullname,12px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:190px}.heroValue{text-align:right;color:#5df29f;font-size:var(--lineTotal,29px);font-weight:900}.heroValue small{display:block;color:#79bfdf;font-size:10px}.statusLine{font-size:var(--status,12px);color:#b7d9ea;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.areaRow{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid #214355;border-bottom:1px solid #214355;margin:var(--card-section-space,5px) 0}.areaRow .area{flex:1;min-width:0;border:0;margin:0}.area{font-size:var(--zone,21px);color:#8fdcff;font-weight:900;margin:0;padding:4px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:calc(3px * var(--card-scale,1)) calc(9px * var(--card-scale,1))}.metrics div{display:flex;justify-content:space-between;align-items:center;line-height:1.05;font-size:var(--metricLabel,14px);padding:3px 0}.metrics b{font-size:var(--metricValue,17px)}.performanceMetric{grid-column:1/-1}.performanceMetric b{font-size:var(--performance,22px)}.metrics span{color:#85b5ce}.metrics b{color:#e9f8ff}.metrics .good{color:#5df29f}.metrics .warn{color:#ffd166}.metrics .bad{color:#ff6b79}.metrics .neutral{color:#91b5c8} .offStandardBlock{margin-top:auto}.offTitle{display:flex;line-height:1;justify-content:space-between;align-items:center;margin-top:7px;padding-top:6px;border-top:1px solid #28516a;color:#9bdcff;font-size:var(--offHeader,12px);font-weight:900}.offTitle b{font-size:var(--offValue,16px);color:#fff}.offGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:5px}.offGrid div{border-radius:4px;padding:5px 6px;text-align:center}.offGrid span{display:block;font-size:var(--offTileLabel,9px);font-weight:900}.offGrid b{display:block;line-height:1;font-size:var(--offTileValue,15px);margin-top:2px}.approved{background:rgba(0,166,140,.16);color:#5df2cb}.partial{background:rgba(56,150,255,.16);color:#75bdff}.pending{background:rgba(56,150,255,.20);color:#75bdff}.denied{background:rgba(255,58,58,.16);color:#ff7b86}.detailKpis{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:5px 0 12px}.detailKpis div{background:#0b202d;border:1px solid #28516a;border-radius:6px;padding:10px}.detailKpis span{display:block;font-size:11px;text-transform:uppercase}.detailKpis b{display:block;font-size:22px;margin-top:3px}
+      .side{display:grid;grid-template-rows:190px 190px minmax(0,1fr);gap:8px;min-height:0}.side.zonesOff{grid-template-rows:190px minmax(0,1fr)}.side.zonesOff .rankingPanel{height:100%;overflow:auto}.side.zonesOff .rank{overflow:auto}.zonePanel[hidden]{display:none!important}.panel{background:#0b202d;border:1px solid #28516a;border-radius:7px;padding:9px;overflow:hidden;flex:1}.panel h3{font-size:var(--sideHeading,16px);color:#8fdcff;margin:0 0 6px}.rankSub{color:#78b7d6;font-size:11px;font-weight:900;margin:-2px 0 6px}.rankingEmpty{display:block!important;padding:18px 5px!important;text-align:center;color:#7faabd;font-size:10px}.rank div{display:grid;grid-template-columns:28px 1fr 70px;gap:8px;padding:5px 2px;font-size:var(--rankingName,14px);border-bottom:1px solid #173747}.rank strong,.feed strong{color:#5df29f;text-align:right;font-size:var(--rankingValue,16px)}.feed div{display:grid;grid-template-columns:54px 1fr 68px 35px;gap:4px;padding:4px 0;border-bottom:1px solid #173747;font-size:10px}.feed time{color:#8fdcff}.feed span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .controls{height:40px;border-top:1px solid #244b61;background:#071b28;display:flex;align-items:center;gap:6px;padding:5px 10px}.controls .status{margin-right:auto;color:#8fc8e5;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.controls button,.controls input,.controls select{height:28px;background:#0c2635;color:#fff;border:1px solid #35617a;border-radius:4px;padding:4px 8px;font-weight:800}.controls button:disabled{opacity:.4}.controls .close{background:#8b1d2c}.groupFilter{display:flex;gap:7px;align-items:center;padding:0 7px;border:1px solid #35617a;border-radius:4px;height:28px;background:#0c2635}.groupFilter[hidden]{display:none}.groupFilter label{font-size:10px;font-weight:800;white-space:nowrap}.groupFilter input{height:auto;margin:0 3px 0 0}.empty{display:grid;place-items:center;grid-column:1/-1;color:#84bdd8;font-size:22px}
+      .detailShade{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.84);padding:3vh 3vw}.detailBox{height:94vh;background:#071b28;border:1px solid #3c7594;border-radius:10px;display:flex;flex-direction:column}.detailHead{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #28516a}.detailHead h2{margin:0;color:#8fdcff}.detailHead h2 small{font-size:14px;color:#a9c9da}.detailHead p{margin:4px 0 0;color:#5df29f;font-weight:900}.detailHead button{background:#8b1d2c;color:#fff;border:1px solid #b14b58;border-radius:5px;padding:8px 15px;font-weight:900}.detailBody{overflow:auto;padding:10px 15px}.detailBody h3{color:#8fdcff}.detailBody table{width:100%;border-collapse:collapse;font-size:12px}.detailBody th,.detailBody td{padding:6px 8px;border-bottom:1px solid #21465c;text-align:left}.detailBody th{position:sticky;top:0;background:#0b202d;color:#8fdcff}.bulkRow{background:rgba(37,143,220,.10)}.offRow{background:rgba(255,88,105,.08)}
+      .settingsShade{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.86);padding:5vh 8vw}.settingsBox{height:90vh;background:#071b28;border:1px solid #3c7594;border-radius:11px;display:flex;flex-direction:column}.settingsHead{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid #28516a}.settingsHead h2{margin:0;color:#8fdcff;font-size:25px}.settingsHead p{margin:4px 0 0;color:#9cc6da}.settingsHead button,.settingsFoot button{background:#18394b;color:#fff;border:1px solid #3c7594;border-radius:6px;padding:9px 15px;font-weight:900}.settingsLayout{display:grid;grid-template-columns:220px 1fr;flex:1;min-height:0}.settingsTabs{padding:12px;background:#081823;border-right:1px solid #28516a}.settingsTabs button{display:block;width:100%;text-align:left;background:transparent;color:#9cc6da;border:0;border-radius:6px;padding:13px 12px;font-weight:900;font-size:14px;margin-bottom:4px}.settingsTabs button.active{background:#0d3850;color:#71d1ff;border-left:4px solid #2da7e8}.settingsContent{padding:22px;overflow:auto}.settingsContent h3{font-size:22px;color:#8fdcff}.settingsContent p{font-size:14px;color:#b6d3e2}.settingsContent textarea{width:100%;height:320px;background:#06131d;color:#fff;border:1px solid #39677f;border-radius:7px;padding:12px;font:16px Consolas,monospace}.settingsFoot{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding:12px 18px;border-top:1px solid #28516a}.settingsFoot span{margin-right:auto;color:#5df29f;font-weight:900}.settingsFoot .successMsg{color:#5df29f}.settingsFoot .errorMsg{color:#ff7b86}.settingsFoot .save{background:#087fc2}
+      .fieldLabel{display:flex;flex-direction:column;gap:8px;max-width:360px;color:#8fdcff;font-size:14px;font-weight:900}.fieldLabel input{height:48px;background:#06131d;color:#fff;border:1px solid #39677f;border-radius:7px;padding:8px 12px;font-size:22px}.transferActions{display:flex;gap:12px;margin:18px 0}.transferActions button,.importButton{display:inline-flex;align-items:center;background:#087fc2;color:#fff;border:1px solid #58bcea;border-radius:7px;padding:12px 18px;font-weight:900;cursor:pointer}.importButton input{display:none}.settingNote{margin-top:12px;padding:12px;background:#0c2939;border:1px solid #28516a;border-radius:6px;color:#8fdcff}
+      .sizingHeader{display:flex;justify-content:space-between;gap:15px;align-items:start}.sizingHeader button{background:#18394b;color:#fff;border:1px solid #3c7594;border-radius:6px;padding:9px 13px;font-weight:900}.layoutSettings{display:grid;grid-template-columns:repeat(2,minmax(180px,280px)) minmax(180px,240px);gap:14px;align-items:end;margin:18px 0}.layoutSettings label{display:flex;flex-direction:column;gap:7px;color:#8fdcff;font-size:13px;font-weight:900}.layoutSettings input{height:48px;background:#06131d;color:#fff;border:1px solid #39677f;border-radius:7px;padding:8px 12px;font-size:22px}.layoutResult{height:72px;background:#0b202d;border:1px solid #28516a;border-radius:7px;padding:9px 14px}.layoutResult span{display:block;color:#8fdcff;font-size:11px;font-weight:900}.layoutResult b{display:block;color:#5df29f;font-size:28px;margin-top:3px}.gridPreviewWrap{background:#06131d;border:1px solid #28516a;border-radius:8px;padding:16px}.previewLabel{color:#8fdcff;font-size:11px;font-weight:900;margin-bottom:10px}.gridPreview{display:grid;gap:5px;width:100%;height:430px}.gridPreview div{display:grid;place-items:center;background:#0b202d;border:2px solid #28516a;border-left:5px solid #258fdc;border-radius:5px;color:#79bfdf;font-size:12px;font-weight:900;min-width:0;min-height:0}
+      .timingSettings{display:grid;gap:12px;max-width:780px;margin-top:18px}.timingSettings>label{display:grid;grid-template-columns:1fr 220px;align-items:center;gap:18px;background:#0b202d;border:1px solid #28516a;border-radius:7px;padding:14px}.timingSettings span b{display:block;color:#8fdcff;font-size:15px}.timingSettings span small{display:block;color:#9cc6da;margin-top:4px}.timingSettings input[type=number]{height:44px;background:#06131d;color:#fff;border:1px solid #39677f;border-radius:6px;padding:7px 10px;font-size:20px}.toggleSetting input{justify-self:end;width:24px;height:24px;accent-color:#2da7e8}.numberWithUnit{display:grid;grid-template-columns:1fr 60px;align-items:center;gap:8px}.numberWithUnit em{color:#8fb9cd;font-size:11px}
+      .detailActions{display:flex;align-items:center;gap:10px}.detailActions label{display:flex;flex-direction:column;gap:4px;color:#8fdcff;font-size:9px;font-weight:900}.detailActions select{min-width:190px;height:35px;background:#0c2635;color:#fff;border:1px solid #3c7594;border-radius:5px;padding:5px 8px;font-weight:900}.detailActions span{max-width:220px;font-size:11px;font-weight:900}.detailActions .successMsg{color:#5df29f}.detailActions .errorMsg{color:#ff7b86}.groupsHeader{display:flex;justify-content:space-between;gap:18px;align-items:start}.groupsHeader button{background:#087fc2;color:#fff;border:1px solid #58bcea;border-radius:6px;padding:10px 16px;font-weight:900}.groupsList{display:grid;gap:8px;margin:16px 0}.groupEditorRow{display:grid;grid-template-columns:38px minmax(220px,1fr) 110px 80px;align-items:center;gap:9px;background:#0b202d;border:1px solid #28516a;border-radius:7px;padding:9px}.groupNumber{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#0d3850;color:#71d1ff;font-weight:900}.groupNameInput{height:39px;background:#06131d;color:#fff;border:1px solid #39677f;border-radius:5px;padding:6px 10px;font-size:15px;font-weight:900}.groupCount{color:#9cc6da;font-size:11px;text-align:right}.deleteGroup{background:#6f2330;color:#fff;border:1px solid #a64b59;border-radius:5px;padding:8px;font-weight:900}.emptyGroups{padding:28px;text-align:center;background:#081823;border:1px dashed #39677f;border-radius:7px;color:#8fb9cd}
+      .statusRow{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:25px}.statusRow .statusLine{min-width:0;flex:1}.statusRow.shiftOnly{justify-content:flex-end}.groupTag{display:inline-flex;align-items:center;justify-content:center;min-width:38px;max-width:90px;padding:5px 9px;border-radius:999px;background:var(--group-color,#258fdc);color:var(--group-text,#fff);border:2px solid rgba(255,255,255,.28);font-size:12px;font-weight:900;letter-spacing:.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 0 10px color-mix(in srgb,var(--group-color,#258fdc) 45%,transparent)}.detailGroupTag{display:inline-flex;align-items:center;justify-content:center;padding:8px 12px;border-radius:999px;background:var(--group-color,#258fdc);color:var(--group-text,#fff);border:2px solid rgba(255,255,255,.3);font-size:13px;font-weight:900}.detailGroupTag[hidden]{display:none}.groupEditorRow{grid-template-columns:36px minmax(170px,1.3fr) minmax(100px,.55fr) minmax(180px,.8fr) 70px 90px 72px}.groupEditorRow label{display:block;min-width:0}.groupEditorRow label small{display:block;color:#8fdcff;font-size:8px;font-weight:900;margin-bottom:4px}.groupAbbreviationInput{height:39px;width:100%;background:#06131d;color:#fff;border:1px solid #39677f;border-radius:5px;padding:6px 10px;font-size:15px;font-weight:900;text-transform:uppercase}.groupColorField>div{display:grid;grid-template-columns:46px 1fr;gap:6px}.groupColorInput{width:46px;height:39px;padding:2px;background:#06131d;border:1px solid #39677f;border-radius:5px}.groupColorText{height:39px;min-width:0;background:#06131d;color:#fff;border:1px solid #39677f;border-radius:5px;padding:6px 8px;font:13px Consolas,monospace;text-transform:uppercase}.groupPreviewTag{justify-self:center}.groupEditorRow .groupCount{text-align:center}
+      .shiftTag{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:10px;font-weight:900;white-space:nowrap}.shiftTag.first{background:#123e67;color:#8fdcff;border:1px solid #258fdc}.shiftTag.second{background:#58380d;color:#ffd27a;border:1px solid #d58b24}
+      .kpiPanel{padding:7px!important}.kpiGrid{height:100%;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:7px}.kpiCard{min-width:0;background:#071b28;border:1px solid #28516a;border-radius:7px;padding:7px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}.kpiCard span{width:100%;font-size:clamp(12px,calc(13px * var(--sidebar-scale,1)),19px);line-height:1.05;font-weight:900;color:#8fdcff;text-align:center;white-space:normal}.kpiCard b{font-size:clamp(30px,calc(39px * var(--sidebar-scale,1)),58px);line-height:1;color:#edf8ff;margin-top:7px;text-align:center}.kpiCard.good b{color:#5df29f}.kpiCard.warn b{color:#ffd166}.kpiCard.bad b{color:#ff6b79}.kpiCard.neutral b{color:#91b5c8}
+      .zonePanel{min-height:0}.zoneHead{display:flex;justify-content:space-between;gap:5px;align-items:center}.zoneHead h3{margin:0;font-size:17px}.zoneHead small{font-size:10px;color:#6fa8c4}.zones{overflow-y:auto;overflow-x:hidden;height:calc(100% - 22px);margin-top:3px}.zoneNeed{padding:calc(4px * var(--sidebar-scale,1)) calc(5px * var(--sidebar-scale,1));border-bottom:1px solid #173747}.zoneNeed>div{display:flex;justify-content:space-between;gap:5px}.zoneNeed b{font-size:var(--zoneName,20px);color:#fff}.zoneNeed span{font-size:11px;max-width:190px;color:#83b7cf;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}.zoneNeed strong{display:block;color:#ffcf5a;font-size:var(--zoneNeed,18px);margin:4px 0 3px}.zoneNeed small{color:#a9d2e6;font-size:var(--zoneDetails,12px);line-height:1.35}.zoneLogin,.zoneMuted,.zoneCovered{padding:24px 10px;text-align:center;color:#8fb9cd;font-size:13px}.zoneLogin b{display:block;color:#ffd166;font-size:17px;margin-bottom:7px}.zoneLogin span{display:block;margin-bottom:9px}.zoneLogin div{display:flex;flex-wrap:wrap;justify-content:center;gap:5px}.zoneLogin button{background:#18394b;color:#fff;border:1px solid #3c7594;border-radius:5px;padding:8px 10px;font-size:11px;font-weight:900}.zoneCovered{color:#5df29f}
+      .zoneNeedHeader{display:flex;justify-content:space-between;align-items:center;gap:6px;line-height:1}.zoneCartonFlow{display:grid!important;grid-template-columns:1fr 1fr;gap:calc(4px * var(--sidebar-scale,1))!important;margin-top:calc(3px * var(--sidebar-scale,1))}.zoneCartonFlow>div{display:flex;justify-content:space-between;align-items:center;background:#071b28;border:1px solid #28516a;border-radius:5px;padding:calc(3px * var(--sidebar-scale,1)) calc(5px * var(--sidebar-scale,1))}.zoneCartonFlow span{max-width:none!important;color:#8fdcff!important;font-size:var(--zoneDetails,12px)!important;font-weight:900;text-align:left!important}.zoneCartonFlow b{color:#5df29f!important;font-size:calc(var(--zoneDetails,12px) + 7px)!important}.zoneNeed.criticalZone{background:linear-gradient(90deg,rgba(116,18,31,.34),rgba(116,18,31,.10));border:1px solid #a92f43;border-left:6px solid #ff4d66;border-radius:6px;margin:2px 0;box-shadow:inset 0 0 20px rgba(255,52,77,.18),0 0 12px rgba(255,52,77,.38)}.zoneNeed.criticalZone .zoneCartonFlow b{color:#ff8a9a!important}.zoneNeed.criticalZone .zoneNeedHeader strong{color:#ff7185}
+      .rankingPanel{padding:10px 13px}.rankingPanel{min-height:0}.rankingPanel .rank{overflow-y:auto;overflow-x:hidden;max-height:calc(100% - 42px)}.zonePanel{padding:calc(7px * var(--sidebar-scale,1)) calc(8px * var(--sidebar-scale,1))}.zoneNeed>div{display:flex;justify-content:space-between;align-items:center;gap:10px}.zoneNeed>div strong{margin:0;text-align:right}.zonePickerNames{display:block!important;max-width:none!important;margin-top:2px;color:#72b9da!important;font-size:var(--pickerNames,11px)!important;text-align:left!important}.zones::-webkit-scrollbar{width:8px}.zones::-webkit-scrollbar-thumb{background:#28516a;border-radius:999px}.zones::-webkit-scrollbar-track{background:#071b28}
+      .innerTabs{display:flex;gap:6px;margin:10px 0 16px}.innerTabs button{background:#102c3b;color:#9cc6da;border:1px solid #35617a;border-radius:5px;padding:8px 13px;font-weight:900}.innerTabs button.active{background:#087fc2;color:#fff}.fontControls{display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));gap:10px}.fontControls label{display:grid;grid-template-columns:1fr 70px 24px;align-items:center;gap:6px;background:#0b202d;border:1px solid #28516a;border-radius:6px;padding:10px;color:#8fdcff;font-weight:900}.fontControls input,.rankingSettings input,.rankingSettings select{height:38px;background:#06131d;color:#fff;border:1px solid #39677f;border-radius:5px;padding:5px 8px}.toggleGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.toggleGrid label{background:#0b202d;border:1px solid #28516a;border-radius:6px;padding:12px;color:#bfe5f7;font-weight:900}.toggleGrid input{margin-right:9px;accent-color:#2da7e8}.rankingSettings{display:grid;grid-template-columns:repeat(3,minmax(170px,1fr));gap:14px;max-width:900px}.rankingSettings label{display:flex;flex-direction:column;gap:7px;color:#8fdcff;font-weight:900}
+      .cardTextWorkspace{display:grid;grid-template-columns:minmax(390px,1fr) minmax(430px,560px);gap:18px;align-items:start}.cardTextWorkspace .fontControls{grid-template-columns:repeat(2,minmax(185px,1fr))}.liveCardPreviewWrap{position:sticky;top:0;background:#06131d;border:1px solid #28516a;border-radius:8px;padding:14px;overflow:auto}.liveCardPreviewWrap .previewLabel{color:#8fdcff;font-size:11px;font-weight:900;margin-bottom:10px}.previewPickerCard{width:100%;height:auto;min-height:350px;cursor:default}.previewPickerCard:hover{transform:none}.previewPickerCard .cardHead small{max-width:170px}@media(max-width:1250px){.cardTextWorkspace{grid-template-columns:1fr}.liveCardPreviewWrap{position:relative}.cardTextWorkspace .fontControls{grid-template-columns:repeat(3,minmax(165px,1fr))}}
+      .sidebarTextWorkspace{display:grid;grid-template-columns:minmax(380px,1fr) minmax(390px,520px);gap:18px;align-items:start}.sidebarTextWorkspace .fontControls{grid-template-columns:repeat(2,minmax(180px,1fr))}.liveSidebarPreviewWrap{position:sticky;top:0;background:#06131d;border:1px solid #28516a;border-radius:8px;padding:14px}.liveSidebarPreviewWrap .previewLabel{color:#8fdcff;font-size:11px;font-weight:900;margin-bottom:10px}.previewSidebar{height:560px;width:100%;grid-template-rows:190px minmax(0,1fr)}.previewSidebar .panel{min-height:0}.previewSidebar .zones{height:calc(100% - 18px)}@media(max-width:1250px){.sidebarTextWorkspace{grid-template-columns:1fr}.liveSidebarPreviewWrap{position:relative}.sidebarTextWorkspace .fontControls{grid-template-columns:repeat(3,minmax(165px,1fr))}}
+      .zoneOverrideGrid{display:grid;grid-template-columns:repeat(2,minmax(260px,1fr));gap:10px;margin-top:16px}.zoneOverrideGrid label{display:grid;grid-template-columns:1fr 130px;align-items:center;gap:12px;background:#0b202d;border:1px solid #28516a;border-radius:7px;padding:12px}.zoneOverrideGrid b{display:block;color:#8fdcff;font-size:16px}.zoneOverrideGrid small{display:block;color:#8fb9cd;margin-top:3px}.zoneOverrideGrid input{height:40px;background:#06131d;color:#fff;border:1px solid #39677f;border-radius:5px;padding:6px 9px;font-size:18px}
+      .zoneBreakStatus{flex:0 0 auto;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:900;white-space:nowrap}.zoneBreakStatus.lunch{background:#6a4310;border:1px solid #f0a62b;color:#ffd27a;box-shadow:0 0 10px rgba(240,166,43,.28)}.zoneBreakStatus.break{background:#4e4210;border:1px solid #e4c54a;color:#fff08a;box-shadow:0 0 10px rgba(228,197,74,.24)}
+      .zoneNeed{padding-top:3px;padding-bottom:3px}}
+      @media(max-height:800px){.rank div{padding:3px 2px}.zoneNeed{padding-top:2px;padding-bottom:2px}.zoneCartonFlow>div{padding-top:2px;padding-bottom:2px}.zonePickerNames{font-size:max(8px,calc(var(--pickerNames,11px) * .85))!important}}
+      @media(max-width:1450px){.layout{grid-template-columns:minmax(0,1fr) 340px}.tickerItem{font-size:15px;padding:0 18px}.tickerItem strong{font-size:18px}}
+    </style></head><body><header class="top"><div id="ticker" class="ticker"></div></header><div class="layout"><main id="cards" class="cards"></main><aside class="side"><section class="panel kpiPanel"><div id="kpis" class="kpiGrid"></div></section><section class="panel rankingPanel"><h3 id="rankingTitle">PRODUCTIVITY RANKING</h3><div class="rankSub">ADJUSTED LPH | MODs + OVERRIDES</div><div id="rank" class="rank"></div></section><section class="panel zonePanel"><div class="zoneHead"><h3>ZONES NEEDING PICKERS</h3><small id="zoneStamp">Loading</small></div><div id="zones" class="zones"></div></section></aside></div><footer class="controls"><div id="status" class="status">READY</div><b id="page"></b><button id="prev">&lt;</button><button id="next">&gt;</button><div id="groupFilter" class="groupFilter"><label><input id="firstShift" type="checkbox" checked> First Shift (before 12:45 PM)</label><label><input id="secondShift" type="checkbox" checked> Second Shift (12:45 PM+)</label></div><input id="filter" placeholder="Filter picker or area"><select id="sort"><option value="name">Alphabetical</option><option value="units">Lines</option><option value="rate">Rate</option><option value="performance">Performance</option><option value="recent">Recent</option></select><input id="date" type="date"><button id="refresh">Refresh</button><button id="start">Start Live</button><button id="stop">Stop</button><button id="settings">Settings</button><button id="fullscreen">Fullscreen</button><button id="close" class="close">Close</button></footer></body></html>`;
+  }
+
+  function openDashboard() {
+    if (document.getElementById(`${APP_ID}-overlay`)) return;
+    state.selectedDate = operationalDate();
+    const overlay = document.createElement('div');
+    overlay.id = `${APP_ID}-overlay`;
+    Object.assign(overlay.style, { position: 'fixed', inset: '0', zIndex: '2147483646', background: '#000' });
+    const frame = document.createElement('iframe');
+    frame.srcdoc = dashboardHtml();
+    frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    Object.assign(frame.style, { width: '100%', height: '100%', border: '0' });
+    overlay.appendChild(frame);
+    document.body.appendChild(overlay);
+    state.overlay = overlay;
+    state.frame = frame;
+    frame.onload = () => {
+      const d = frame.contentDocument;
+      const $ = id => d.getElementById(id);
+      state.ui = { ticker: $('ticker'), cards: $('cards'), kpis: $('kpis'), rank: $('rank'), feed: $('feed'), zones: $('zones'), zoneStamp: $('zoneStamp'), status: $('status'), page: $('page'), filter: $('filter'), sort: $('sort'), date: $('date'), groupFilter: $('groupFilter'), firstShift: $('firstShift'), secondShift: $('secondShift'), rankingTitle: $('rankingTitle'), activityTitle: $('activityTitle'), start: $('start'), stop: $('stop'), detailOpen: false };
+      state.ui.date.value = state.selectedDate;
+      state.ui.sort.value = state.sort;
+      restartResponsiveSizingObserver();
+      $('prev').onclick = () => { state.page--; renderCards(); };
+      $('next').onclick = () => { state.page++; renderCards(); };
+      const updateGroups = () => {
+        state.breakpackGroups = new Set();
+        if (state.ui.firstShift.checked) state.breakpackGroups.add('1');
+        if (state.ui.secondShift.checked) state.breakpackGroups.add('2');
+        state.page = 0;
+        processData(state.data || { associateDetails: [] });
+        render();
+      };
+      $('firstShift').onchange = updateGroups;
+      $('secondShift').onchange = updateGroups;
+      $('filter').oninput = event => { state.filter = event.target.value; state.page = 0; renderCards(); };
+      $('sort').onchange = event => {
+        state.sort = event.target.value;
+        state.page = 0;
+        saveSettings();
+        renderCards();
+      };
+      $('date').onchange = event => {
+        const selected = event.target.value;
+        state.selectedDate = selected;
+        state.page = 0;
+        state.lastError = '';
+        refresh(selected, { force: true, supersede: true });
+      };
+      $('refresh').onclick = () => refresh(state.ui.date.value, { force: true, supersede: true });
+      $('start').onclick = start;
+      $('stop').onclick = stop;
+      $('settings').onclick = openSettings;
+      $('fullscreen').onclick = () => overlay.requestFullscreen?.();
+      $('close').onclick = closeDashboard;
+      render();
+      start();
+    };
+  }
+
+  function closeDashboard() {
+    stop();
+    document.getElementById(`${APP_ID}-overlay`)?.remove();
+    state.resizeObserver?.disconnect?.(); state.resizeObserver=null;
+    state.overlay = null;
+    state.frame = null;
+    state.ui = null;
+  }
+
+  function addLaunchButton() {
+    if (!document.body || document.getElementById(`${APP_ID}-button`)) return;
+    const button = document.createElement('button');
+    button.id = `${APP_ID}-button`;
+    button.textContent = 'Open Live Breakpack TV Dashboard';
+    Object.assign(button.style, {
+      position: 'fixed', right: '20px', bottom: '56px', zIndex: '2147483645',
+      background: '#087fc2', color: '#fff', border: '1px solid #58bcea', borderRadius: '999px',
+      padding: '12px 18px', fontWeight: '900', cursor: 'pointer', boxShadow: '0 7px 22px rgba(0,0,0,.38)'
+    });
+    button.onclick = openDashboard;
+    document.body.appendChild(button);
+  }
+
+  function initialize() {
+    loadSettings();
+    scanStorageForToken();
+    addLaunchButton();
+    const observer = new MutationObserver(addLaunchButton);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialize, { once: true });
+  else initialize();
+})();
