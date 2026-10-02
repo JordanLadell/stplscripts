@@ -10,7 +10,7 @@
 // ==UserScript==
 // @name         Vision - Live Bulk Picker TV Dashboard
 // @namespace    staples.orlando.vision.bulk
-// @version      6.22.15
+// @version      6.22.16
 // @description  Standalone Bulk picker credit dashboard using Vision Associate Productivity data.
 // @match        https://sci-prod.az.staples.com/vision/clientWeb/flr/associateProductivity/*
 // @match        https://sci-prod.az.staples.com/vision/clientWeb/flr/associateProductivity*
@@ -39,9 +39,6 @@
     highVolumeBatchDetailUrl: 'http://lcvyprwbv05.staples.com:6801/Home/BatchDetail?batchid=',
     prescanUrl: 'http://lcvyprwbv05.staples.com:6801/Home/PrescanReport',
     hubStatusUrl: 'http://lcvyprwbv05.staples.com:6801/Home/HubStatus',
-    hubStatusDpUrl: 'http://lcvyprwbv05.staples.com:6801/Home/HubStatusDP',
-    zoneManagementUrl: 'http://lcvyprwbv05.staples.com:6801/Home/ZoneManagement?order=recommended&includePTC=false',
-    dpCartonRefreshMs: 10000,
     batchStatusUrl: 'http://lcvyprwbv05.staples.com:6801/Home/BatchStatus?completed=True',
     zoneStatusUrl: 'http://lcvyprwbv05.staples.com:6801/Home/ZoneStatus',
     visionLoginUrl: 'https://sci-prod.az.staples.com/vision/clientWeb/flr/login',
@@ -162,8 +159,8 @@
     pickers: [], detectedAreas: [], creditRates: {}, enabledAreas: {}, areaAliases: {}, excludedUsernames: new Set(),
     minimumPicks: 0, columns: 5, rows: 5, refreshSeconds: 30,
     sidebarWidthPercent: 14, cardTextPercent: 100, cardFullNamePercent: 100, cardPaddingPercent: 100, cardRowGapPercent: 100, groupBadgeTextPercent: 100, groupBadgeMarginPercent: 100, groupBadgeSizePercent: 100, highVolumeMultiplier: 0.75, sidebarTextPercent: 100, sidebarPaddingPercent: 100, sidebarRowGapPercent: 100, tickerTextPercent: 100, tickerHeightPercent: 100, tickerSpacingPercent: 100, showTicker: true,
-    rankingPeople: 10, rankingRotationSeconds: 10, rankingView: 'FT', rankingPrimaryMetric: 'creditPerActiveHour', rankingSecondaryMetric: 'totalCredit', cardPrimaryMetric: 'totalCredit', cardSecondaryMetric: 'creditPerActiveHour', rankingRotationTimer: null, tickerSignature: '', tickerStructureSignature: '', workLeftGroups: normalizeWorkLeftGroups(), workLeftTotals: [], workLeftRefreshSeconds: 60, workLeftTimer: null, workLeftRefreshing: false, workLeftAreaCounts: {}, workLeftAreaHealth: {}, workLeftSourceRefreshing: false, workLeftError: '', workLeftLastRefresh: null, dpModsCartons: null, dpInZoneCartons: null, dpModsError: '', dpInZoneError: '', dpCartonRefreshing: false, dpCartonTimer: null, disBatchPending: 0, disHubError: '', floorBatchPending: 0, floorBatchError: '', renderFrame: null, sourceHealth: {}, history: {}, pingHistory: [], lastPingSampleAt: 0, healthTimer: null, workLeftRequestId: 0, workLeftRetryTimer: null, visionRetryTimer: null, cardsSignature: '', rankingSignature: '', goalsSignature: '', areaScrollResyncTimer: null, dateFollowsToday: true, dateRolloverTimer: null, pickerGroups: [], classificationRules: normalizeClassificationRules(), groupCreditGoals: {}, goalOperationalDate: '', goalWarningPercent: 70, goalNearPercent: 90, goalLowColor: '#f2707d', goalWarningColor: '#e8b455', goalNearColor: '#9FB8D9', goalMetColor: '#3ECF8E', cardElementStyles: normalizeCardElementStyles(), filter: '', sort: 'name',
-    visionLoginRequired: false, dpLoginFlags: { zoneStatus: false, zoneManagement: false, highVolume: false, prescan: false }, visionLastDataAt: null, dpLastDataAt: null,
+    rankingPeople: 10, rankingRotationSeconds: 10, rankingView: 'FT', rankingPrimaryMetric: 'creditPerActiveHour', rankingSecondaryMetric: 'totalCredit', cardPrimaryMetric: 'totalCredit', cardSecondaryMetric: 'creditPerActiveHour', rankingRotationTimer: null, tickerSignature: '', tickerStructureSignature: '', workLeftGroups: normalizeWorkLeftGroups(), workLeftTotals: [], workLeftRefreshSeconds: 60, workLeftTimer: null, workLeftRefreshing: false, workLeftAreaCounts: {}, workLeftAreaHealth: {}, workLeftSourceRefreshing: false, workLeftError: '', workLeftLastRefresh: null, disBatchPending: 0, disHubError: '', floorBatchPending: 0, floorBatchError: '', renderFrame: null, sourceHealth: {}, history: {}, pingHistory: [], lastPingSampleAt: 0, healthTimer: null, workLeftRequestId: 0, workLeftRetryTimer: null, visionRetryTimer: null, cardsSignature: '', rankingSignature: '', goalsSignature: '', areaScrollResyncTimer: null, dateFollowsToday: true, dateRolloverTimer: null, pickerGroups: [], classificationRules: normalizeClassificationRules(), groupCreditGoals: {}, goalOperationalDate: '', goalWarningPercent: 70, goalNearPercent: 90, goalLowColor: '#f2707d', goalWarningColor: '#e8b455', goalNearColor: '#9FB8D9', goalMetColor: '#3ECF8E', cardElementStyles: normalizeCardElementStyles(), filter: '', sort: 'name',
+    visionLoginRequired: false, dpLoginFlags: { zoneStatus: false, highVolume: false, prescan: false }, visionLastDataAt: null, dpLastDataAt: null,
     showingHistoricalPreview: false, historicalPreviewDate: '', loadingWithoutSavedData: false, goalHitTimes: {}
   };
   function anyDpLoginRequired(){return Object.values(state.dpLoginFlags||{}).some(Boolean);}
@@ -630,7 +627,7 @@
     const first=rows[0].operationalDate,last=rows.at(-1).operationalDate;downloadTextFile(`Vision_Bulk_Associate_Daily_History_${first}_to_${last}.csv`,csv);
     return rows.length;
   }
-  function exportHistoricalData(){downloadJsonFile(`Vision_Bulk_Dashboard_History_${formatDate(new Date())}.json`,{format:'VisionBulkDashboardHistory',schemaVersion:2,scriptVersion:'6.22.15',exportedAt:new Date().toISOString(),days:historyRows(),visionPingHistory:state.pingHistory});}
+  function exportHistoricalData(){downloadJsonFile(`Vision_Bulk_Dashboard_History_${formatDate(new Date())}.json`,{format:'VisionBulkDashboardHistory',schemaVersion:2,scriptVersion:'6.22.16',exportedAt:new Date().toISOString(),days:historyRows(),visionPingHistory:state.pingHistory});}
   function weightedRate(days){const credit=days.reduce((sum,day)=>sum+n(day.creditProduced||day.pickers?.reduce((x,p)=>x+n(p.totalCredit),0)),0),seconds=days.reduce((sum,day)=>sum+n(day.activeSeconds||day.pickers?.reduce((x,p)=>x+n(p.activeSeconds),0)),0);return seconds>0?credit/(seconds/3600):0;}
   function trackedWorkLeftRows(){
     const order=['header','unit_pick','pick_to_belt','calendars','reserve'];
@@ -765,49 +762,6 @@
     finally{state.workLeftRefreshing=false;renderStatus();}
   }
   function restartWorkLeftTimer(){clearInterval(state.workLeftTimer);state.workLeftTimer=null;if(!state.running)return;state.workLeftTimer=setInterval(()=>{if(state.selectedDate===operationalDate())refreshWorkLeft();},state.workLeftRefreshSeconds*1000);}
-  function fetchDecisionPointHtml(url,label){
-    if(typeof GM_xmlhttpRequest!=='function')return Promise.reject(new Error(`${label} connection is unavailable.`));
-    return new Promise((resolve,reject)=>GM_xmlhttpRequest({method:'GET',url,timeout:20000,anonymous:false,onload:response=>response.status>=200&&response.status<400?resolve(response.responseText):reject(new Error(`${label} HTTP ${response.status}`)),onerror:()=>reject(new Error(`${label} connection failed.`)),ontimeout:()=>reject(new Error(`${label} request timed out.`))}));
-  }
-  function parseHubStatusMods(html){
-    const doc=new DOMParser().parseFromString(html,'text/html');
-    const table=[...doc.querySelectorAll('table')].find(candidate=>/\bmod\b/i.test(candidate.tHead?.textContent||'')&&/\btotal\b/i.test(candidate.tHead?.textContent||''));
-    if(!table){const error=new Error('Hub Status table was not found. Log into Decision Point once.');error.code='DP_LOGIN_REQUIRED';throw error;}
-    const headers=[...table.querySelectorAll('thead th')].map(cell=>cell.textContent.replace(/\s+/g,' ').trim().toLowerCase()),modIndex=headers.findIndex(header=>header==='mod');
-    if(modIndex<0)throw new Error('Hub Status MOD column was not found.');
-    const totalRow=[...table.querySelectorAll('tbody tr')].find(row=>/^total$/i.test((row.cells[0]?.textContent||'').trim()));
-    if(!totalRow)throw new Error('Hub Status total row was not found.');
-    return Number((totalRow.cells[modIndex]?.textContent||'0').replace(/[^0-9.-]/g,''))||0;
-  }
-  function parseZoneManagementInZone(html){
-    const doc=new DOMParser().parseFromString(html,'text/html');
-    const heading=[...doc.querySelectorAll('h1,h2,h3')].some(node=>/zone management/i.test(node.textContent||''));
-    const table=[...doc.querySelectorAll('table')].find(candidate=>/rec\.\s*pickers/i.test(candidate.tHead?.textContent||''));
-    if(!heading||!table){const error=new Error('Zone Management table was not found. Log into Decision Point once.');error.code='DP_LOGIN_REQUIRED';throw error;}
-    const headers=[...table.querySelectorAll('thead th')].map(cell=>cell.textContent.replace(/\s+/g,' ').trim().toLowerCase()),inZoneIndex=headers.findIndex(header=>header==='in zone'||header.includes('in zone')),inactiveIndex=headers.findIndex(header=>header==='inactive'||header.includes('inactive'));
-    if(inZoneIndex<0||inactiveIndex<0)throw new Error('Zone Management In Zone/Inactive columns were not recognized.');
-    return [...table.querySelectorAll('tbody tr')].reduce((total,row)=>{
-      if(/^total$/i.test((row.cells[0]?.textContent||'').trim()))return total;
-      const value=index=>Math.max(0,Number(String(row.cells[index]?.textContent||'0').replace(/,/g,'').trim())||0);
-      return total+value(inZoneIndex)+value(inactiveIndex);
-    },0);
-  }
-  async function refreshDpCartonMetrics(){
-    if(!state.running||state.dpCartonRefreshing)return;
-    state.dpCartonRefreshing=true;
-    const [zonesResult,modsResult]=await Promise.allSettled([fetchDecisionPointHtml(CONFIG.zoneManagementUrl,'Zone Management'),fetchDecisionPointHtml(CONFIG.hubStatusDpUrl,'Hub Status DP')]);
-    let zoneError=null,modsError=null,succeeded=false;
-    if(zonesResult.status==='fulfilled')try{state.dpInZoneCartons=parseZoneManagementInZone(zonesResult.value);succeeded=true;}catch(error){zoneError=error;}
-    else zoneError=zonesResult.reason;
-    if(modsResult.status==='fulfilled')try{state.dpModsCartons=parseHubStatusMods(modsResult.value);succeeded=true;}catch(error){modsError=error;}
-    else modsError=modsResult.reason;
-    state.dpInZoneError=zoneError?.message||'';state.dpModsError=modsError?.message||'';
-    state.dpCartonError=[zoneError,modsError].filter(Boolean).map(error=>error?.message||String(error)).join('; ');
-    state.dpLoginFlags.zoneManagement=[zoneError,modsError].some(error=>error?.code==='DP_LOGIN_REQUIRED');
-    if(succeeded)state.dpLastDataAt=new Date();
-    state.dpCartonRefreshing=false;renderTicker();renderStatus();renderLoginBanner();
-  }
-  function restartDpCartonMetricsTimer(){clearInterval(state.dpCartonTimer);state.dpCartonTimer=null;if(!state.running)return;refreshDpCartonMetrics();state.dpCartonTimer=setInterval(refreshDpCartonMetrics,CONFIG.dpCartonRefreshMs);}
   const isBulkUser = a => String(a?.label || '').includes('!');
   const rawAreaName = d => {const classified=headerAreaFromVisionDetail(d);if(classified==='__EXCLUDED_CLASSIFICATION__')return classified;return classified||String(d?.work_location||d?.area||'UNASSIGNED').trim().replace(/\s+/g,' ').toUpperCase()||'UNASSIGNED';};
   const areaName = d => canonicalAreaKey(rawAreaName(d));
@@ -917,6 +871,7 @@
     const text=String(zone||'').trim().toUpperCase();
     if(text==='FLOOR'||text==='BULK'||text.startsWith('FLOOR '))return 'BULK';
     if(/^PTB\b/.test(text)||text.includes('PICK TO BELT'))return 'PICK TO BELT';
+    if(/^RESERVE(?:\s*\d+)?$/.test(text))return 'RESERVE';
     return canonicalAreaKey(text);
   }
   function highVolumeDisplayArea(baseArea){return `HIGH VOLUME ${displayAreaName(baseArea)}`;}
@@ -942,20 +897,21 @@
     if(!table){const error=new Error(`Batch ${batch.batchId} details were not found. Log into Decision Point Bulk & Case once.`);error.code='DP_LOGIN_REQUIRED';throw error;}
     const headers=[...table.querySelectorAll('thead th')].map(th=>th.textContent.replace(/\s+/g,' ').trim().toLowerCase());
     const index=name=>headers.findIndex(header=>header===name||header.includes(name));
-    const indexes={qty:index('qty'),status:index('status'),picker:index('picker'),picked:index('picked')};
-    if(indexes.qty<0||indexes.status<0||indexes.picker<0||indexes.picked<0)throw new Error(`Batch ${batch.batchId} detail columns were not recognized.`);
+    const indexes={carton:index('carton number'),status:index('status'),picker:index('picker'),picked:index('picked')};
+    if(indexes.carton<0||indexes.status<0||indexes.picker<0||indexes.picked<0)throw new Error(`Batch ${batch.batchId} detail columns were not recognized.`);
     const rows=[...table.querySelectorAll('tbody tr')].map(row=>{
       const cells=[...row.cells],text=key=>(cells[indexes[key]]?.textContent||'').replace(/\s+/g,' ').trim();
-      return {qty:Math.max(0,Number(text('qty').replace(/,/g,''))||0),status:text('status'),picker:text('picker'),pickedAt:text('picked')};
-    }).filter(row=>row.qty>0);
+      return {carton:text('carton'),status:text('status'),picker:text('picker'),pickedAt:text('picked')};
+    }).filter(row=>row.carton);
+    const wasPicked=row=>Boolean(row.pickedAt)||/^(picked|complete|completed)$/i.test(row.status);
     const allocations={};
     for(const row of rows){
-      if(!row.picker||!row.pickedAt)continue;
+      if(!row.picker||!wasPicked(row))continue;
       const pickerKey=row.picker.toLowerCase();
-      if(!allocations[pickerKey])allocations[pickerKey]={picker:row.picker,pickerKey,picks:0};
-      allocations[pickerKey].picks+=row.qty;
+      if(!allocations[pickerKey])allocations[pickerKey]={picker:row.picker,pickerKey,cartons:new Set()};
+      allocations[pickerKey].cartons.add(row.carton);
     }
-    return {allocations:Object.values(allocations),complete:rows.length>0&&rows.every(row=>row.picker&&row.pickedAt)};
+    return {allocations:Object.values(allocations).map(({cartons,...allocation})=>({...allocation,picks:cartons.size})),complete:rows.length>0&&rows.every(row=>row.picker&&wasPicked(row))};
   }
   function fetchHighVolumeBatchDetail(batchId){
     if(typeof GM_xmlhttpRequest!=='function')return Promise.reject(new Error('Decision Point batch details are unavailable in this script runner.'));
@@ -1185,19 +1141,28 @@
     if(dateChanged)prepareDateLoad(date);
     const id=++state.requestId, controller=new AbortController(); state.controller=controller; state.refreshing=true; state.selectedDate=date; renderStatus();render();
     try {
+      const highVolumeLoad=fetchHighVolumeReport(date)
+        .then(html=>highVolumePickedRows(parseHighVolumeReport(html),date))
+        .then(result=>({result}),error=>({error}));
+      const prescanLoad=fetchPrescanReport(date)
+        .then(html=>({rows:parsePrescanReport(html)}),error=>({error}));
       const json=await fetchVision(date,controller);
       if(id!==state.requestId)return;
       state.visionLoginRequired=false;
       state.visionLastDataAt=new Date();
+      const [highVolume,prescan]=await Promise.all([highVolumeLoad,prescanLoad]);
+      if(id!==state.requestId||state.selectedDate!==date)return;
+      if(highVolume.error){
+        state.highVolumeRows=[];state.highVolumeError=highVolume.error.message||String(highVolume.error);state.dpLoginFlags.highVolume=highVolume.error.code==='DP_LOGIN_REQUIRED';
+      }else{
+        state.highVolumeRows=highVolume.result.allocations;state.highVolumeError=highVolume.result.error;state.dpLoginFlags.highVolume=/DP_LOGIN_REQUIRED/.test(highVolume.result.error);state.dpLastDataAt=new Date();
+      }
+      if(prescan.error){
+        state.prescanRows=[];state.prescanError=prescan.error.message||String(prescan.error);state.dpLoginFlags.prescan=prescan.error.code==='DP_LOGIN_REQUIRED';
+      }else{
+        state.prescanRows=prescan.rows;state.prescanError='';state.dpLoginFlags.prescan=false;state.dpLastDataAt=new Date();
+      }
       processData(json);render();renderLoginBanner();
-      const enrich=()=>{if(id!==state.requestId||state.selectedDate!==date)return;processData(json);render();};
-      fetchHighVolumeReport(date).then(async html=>{
-        if(id!==state.requestId||state.selectedDate!==date)return;
-        const reportRows=parseHighVolumeReport(html),result=await highVolumePickedRows(reportRows,date);
-        if(id!==state.requestId||state.selectedDate!==date)return;
-        state.highVolumeRows=result.allocations;state.highVolumeError=result.error;state.dpLoginFlags.highVolume=/DP_LOGIN_REQUIRED/.test(result.error);state.dpLastDataAt=new Date();enrich();renderLoginBanner();
-      }).catch(error=>{if(id!==state.requestId||state.selectedDate!==date)return;state.highVolumeRows=[];state.highVolumeError=error.message||String(error);state.dpLoginFlags.highVolume=error.code==='DP_LOGIN_REQUIRED';renderStatus();renderLoginBanner();});
-      fetchPrescanReport(date).then(html=>{state.prescanRows=parsePrescanReport(html);state.prescanError='';state.dpLoginFlags.prescan=false;state.dpLastDataAt=new Date();enrich();renderLoginBanner();}).catch(error=>{state.prescanRows=[];state.prescanError=error.message||String(error);state.dpLoginFlags.prescan=error.code==='DP_LOGIN_REQUIRED';renderStatus();renderLoginBanner();});
     }
     catch(e){if(id!==state.requestId)return;state.loadingWithoutSavedData=false;state.lastError=e.name==='AbortError'?'Request cancelled or timed out.':e.message;state.visionLoginRequired=e.code==='VISION_LOGIN_REQUIRED';render();renderLoginBanner();}
     finally{if(id===state.requestId){state.refreshing=false;state.controller=null;renderStatus();}}
@@ -1532,11 +1497,7 @@
     const top=state.ui.ticker.closest('.top'),ticker=state.ui.ticker;top.style.display='flex';state.ui.tickerViewport.style.display=state.showTicker?'block':'none';state.ui.layout.style.height='calc(100vh - 40px)';
     Object.assign(ticker.style,{animation:'none',width:'100%',minWidth:'0',justifyContent:'center'});
     if(!state.showTicker)return;
-    const ordered=[
-      {id:'dp_mods',name:'MODS CARTONS',label:'MODS CARTONS:',count:state.dpModsCartons,partial:!!state.dpModsError,error:state.dpModsError},
-      {id:'dp_zones',name:'IN ZONES',label:'IN ZONES:',count:state.dpInZoneCartons,partial:!!state.dpInZoneError,error:state.dpInZoneError},
-      ...state.workLeftTotals.map(item=>({...item,label:`${item.name} LEFT:`}))
-    ];
+    const ordered=state.workLeftTotals.map(item=>({...item,label:`${item.name} LEFT:`}));
     if(!ordered.length){
       if(state.tickerStructureSignature!=='empty'){state.tickerStructureSignature='empty';state.tickerSignature='';state.ui.ticker.innerHTML='<section><div><b>WORK LEFT</b><strong data-ticker-value="empty">LOADING</strong></div></section>';}
       const value=state.ui.ticker.querySelector('[data-ticker-value="empty"]');if(value)value.textContent=state.workLeftRefreshing?'LOADING':'NO DATA';return;
@@ -1684,7 +1645,7 @@
     a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
   }
   function exportAllSettings(){
-    downloadJsonFile(`Vision_Bulk_Dashboard_All_Settings_${formatDate(new Date())}.json`,{format:'VisionBulkDashboardAllSettings',schemaVersion:1,scriptVersion:'6.22.15',exportedAt:new Date().toISOString(),settings:currentSettings()});
+    downloadJsonFile(`Vision_Bulk_Dashboard_All_Settings_${formatDate(new Date())}.json`,{format:'VisionBulkDashboardAllSettings',schemaVersion:1,scriptVersion:'6.22.16',exportedAt:new Date().toISOString(),settings:currentSettings()});
   }
   function chooseSettingsImportFile(){
     return new Promise((resolve,reject)=>{const input=document.createElement('input');input.type='file';input.accept='.json,application/json';input.onchange=()=>{const file=input.files?.[0];if(!file){reject(new Error('No settings file selected.'));return;}const reader=new FileReader();reader.onload=()=>resolve(String(reader.result||''));reader.onerror=()=>reject(new Error('Unable to read the settings file.'));reader.readAsText(file);};input.click();});
@@ -1910,7 +1871,7 @@
     requestAnimationFrame(()=>requestAnimationFrame(()=>{fitRankingRows();resyncAreaScrollMetrics();}));
   }
   function startDashboardRuntime(){
-    state.running=true;renderConnectivity();renderLoginBanner();renderHistoryFolderStatus();renderHistorySyncNote();renderMasterBadge();restartTimer();restartWorkLeftTimer();restartDpCartonMetricsTimer();restartHistoryFolderSyncTimer();restartAreaScrollResyncTimer();restartDateRolloverTimer();render();window.addEventListener('resize',handleDashboardResize);refresh();setTimeout(()=>{if(state.running)refreshWorkLeft();},1000);
+    state.running=true;renderConnectivity();renderLoginBanner();renderHistoryFolderStatus();renderHistorySyncNote();renderMasterBadge();restartTimer();restartWorkLeftTimer();restartHistoryFolderSyncTimer();restartAreaScrollResyncTimer();restartDateRolloverTimer();render();window.addEventListener('resize',handleDashboardResize);refresh();setTimeout(()=>{if(state.running)refreshWorkLeft();},1000);
   }
   async function ensureHistoryFolderThenStart(){
     if(state.historyDirStatus==='connected'){startDashboardRuntime();syncHistoryWithFolder();return;}
@@ -1952,7 +1913,7 @@
       catch(error){state.historyDirError=error.message||String(error);renderHistoryFolderGate();}
     };
   }
-  function closeDashboard(){state.running=false;clearInterval(state.refreshTimer);clearInterval(state.rankingRotationTimer);clearInterval(state.workLeftTimer);clearInterval(state.dpCartonTimer);clearInterval(state.historyDirSyncTimer);clearInterval(state.areaScrollResyncTimer);clearInterval(state.dateRolloverTimer);clearTimeout(state.workLeftRetryTimer);clearTimeout(state.visionRetryTimer);state.workLeftRequestId++;state.controller?.abort();if(state.renderFrame!==null){cancelAnimationFrame(state.renderFrame);state.renderFrame=null;}document.getElementById(`${APP_ID}-overlay`)?.remove();window.removeEventListener('resize',handleDashboardResize);state.tickerSignature=state.tickerStructureSignature=state.cardsSignature=state.rankingSignature=state.goalsSignature='';state.overlay=state.frame=state.ui=null;}
+  function closeDashboard(){state.running=false;clearInterval(state.refreshTimer);clearInterval(state.rankingRotationTimer);clearInterval(state.workLeftTimer);clearInterval(state.historyDirSyncTimer);clearInterval(state.areaScrollResyncTimer);clearInterval(state.dateRolloverTimer);clearTimeout(state.workLeftRetryTimer);clearTimeout(state.visionRetryTimer);state.workLeftRequestId++;state.controller?.abort();if(state.renderFrame!==null){cancelAnimationFrame(state.renderFrame);state.renderFrame=null;}document.getElementById(`${APP_ID}-overlay`)?.remove();window.removeEventListener('resize',handleDashboardResize);state.tickerSignature=state.tickerStructureSignature=state.cardsSignature=state.rankingSignature=state.goalsSignature='';state.overlay=state.frame=state.ui=null;}
   function addButton(){if(!document.body||document.getElementById(`${APP_ID}-button`))return;const b=document.createElement('button');b.id=`${APP_ID}-button`;b.textContent='Open Live Bulk TV Dashboard';Object.assign(b.style,{position:'fixed',right:'20px',bottom:'160px',zIndex:'2147483645',background:'#0d9a78',color:'#fff',border:'1px solid #66e1c2',borderRadius:'999px',padding:'12px 18px',fontWeight:'900',cursor:'pointer',boxShadow:'0 7px 22px rgba(0,0,0,.38)'});b.onclick=openDashboard;document.body.appendChild(b);}
   function init(){ensureInstanceIdentity();loadSettings();loadHistory();resetExpiredGoals();loadAdjustmentHistory();scanToken();addButton();new MutationObserver(addButton).observe(document.documentElement,{childList:true,subtree:true});reconnectHistoryFolderSilently();}
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init,{once:true});else init();
