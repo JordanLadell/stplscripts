@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Hide/Show DIS Batches with Correct Picker Column Alignment
 // @namespace    http://tampermonkey.net/
-// @version      2026-10-02.109
+// @version      2026-10-05.110
 // @description  Fixes Picker column, tweaks widths, sorts pickers, auto-scan, relative time, FLAT UI, auto-focuses search, secure background sync, fixed alignment, and adds an A-Z Associate Last Pick sidebar with location and time since scan. KPI mini-cards source remaining counts from Zone Status (so mixed-zone batches are no longer undercounted), exclude DIS from Floor unless "Show DIS" is on while retaining DIS in Unit Pick and Calendars, use a compact responsive layout, dynamically create start groups from each associate first-pick hour, and rate non-High-Volume batch pick efficiency above a configurable carton cutoff.
 // @author       You
 // @match        http://lcvyprwbv05.staples.com:6801/Home/BatchStatus*
@@ -56,6 +56,8 @@
     let dailyHistoryDbPromise = null;
     let historyLoadSequence = 0;
     let historyLoadDateKey = '';
+    // Every page load starts on the live day; a picked historical date is not persisted across loads.
+    localStorage.removeItem('__batch_status_history_date');
     let historicalViewActive = false;
     let displayBatchIndex = null;
     let displayedBatchRows = null;
