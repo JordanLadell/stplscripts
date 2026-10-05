@@ -949,8 +949,8 @@
     }
   }
   function loadAdjustmentHistory(){try{const x=JSON.parse(localStorage.getItem(CONFIG.adjustmentHistoryKey)||'[]');state.manualAdjustments=Array.isArray(x)?x:[]}catch(_){state.manualAdjustments=[]}}
-  const adjustmentsForPicker=label=>state.manualAdjustments.filter(x=>x.pickerKey===String(label).toLowerCase()&&x.operationalDate===(state.selectedDate||operationalDate()));
-  function applyManualAdjustments(areas,label){for(const x of adjustmentsForPicker(label)){const key=`MANUAL: ${x.name.toUpperCase()}::${x.id}`;areas[key]={area:`MANUAL: ${x.name.toUpperCase()}`,picks:n(x.lines),credit:n(x.lines)*n(x.creditPerLine),isManual:true,isRemoval:n(x.lines)<0};}}
+  const adjustmentsForPicker=label=>state.manualAdjustments.filter(x=>!x.deletedAt&&x.pickerKey===String(label).toLowerCase()&&x.operationalDate===(state.selectedDate||operationalDate()));
+  function applyManualAdjustments(areas,label){for(const x of adjustmentsForPicker(label)){const key=`MANUAL: ${x.name.toUpperCase()}::${x.id}`;areas[key]={area:`MANUAL: ${x.name.toUpperCase()}`,picks:n(x.lines),credit:n(x.lines)*n(x.creditPerLine),isManual:true,isRemoval:n(x.lines)<0,adjustmentId:x.id};}}
   function saveAdjustmentsCache(){localStorage.setItem(CONFIG.adjustmentHistoryKey,JSON.stringify(state.manualAdjustments));}
   function adjustmentsByDate(list){const out={};for(const item of list){const key=item.operationalDate;if(!key)continue;(out[key]=out[key]||[]).push(item);}return out;}
   async function readAdjustmentFolderFiles(handle){
@@ -1000,7 +1000,7 @@
       const {parsedByDate,presentDates}=await readAdjustmentFolderFiles(handle);
       const merged=new Map(state.manualAdjustments.map(item=>[item.id,item]));
       let changed=false;
-      for(const list of Object.values(parsedByDate))for(const item of list){if(!merged.has(item.id)){merged.set(item.id,item);changed=true;}}
+      for(const list of Object.values(parsedByDate))for(const item of list){const existing=merged.get(item.id);if(!existing){merged.set(item.id,item);changed=true;}else if(item.deletedAt&&!existing.deletedAt){merged.set(item.id,item);changed=true;}}
       if(changed){
         state.manualAdjustments=[...merged.values()];
         saveAdjustmentsCache();
@@ -1034,6 +1034,18 @@
     if(state.data)processData(state.data);render();
   }
   function summarize(a) {
+  async function deleteManualAdjustment(id){
+    const item=state.manualAdjustments.find(adjustment=>String(adjustment.id)===String(id));
+    if(!item||item.deletedAt)return false;
+    item.deletedAt=new Date().toISOString();
+    saveAdjustmentsCache();
+    if(state.pickDataDirHandle&&state.historyDirStatus==='connected'){
+      const dayList=adjustmentsByDate(state.manualAdjustments)[item.operationalDate]||[];
+      await writeAdjustmentDayFile(state.pickDataDirHandle,item.operationalDate,dayList);
+    }
+    if(state.data)processData(state.data);render();
+    return true;
+  }
     if(!isBulkUser(a))return null;
     const all=(a.time_details||[]), picks=all.filter(isPickRecord); if(!picks.length)return null;
     const areas={};
@@ -1127,7 +1139,7 @@
     for(const a of json.associateDetails.filter(isBulkUser))for(const d of (a.time_details||[]).filter(isPickRecord))detected.add(rawAreaName(d));
     state.detectedAreas=[...detected].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
     const excluded=new Set([...state.excludedUsernames].map(x=>x.toLowerCase()));
-    state.pickers=json.associateDetails.filter(isBulkUser).filter(a=>!excluded.has(String(a.label).toLowerCase())).map(summarize).filter(p=>p&&p.totalPicks>=state.minimumPicks);
+    state.pickers=json.associateDetails.filter(isBulkUser).filter(a=>!excluded.has(String(a.label).toLowerCase())).map(summarize).filter(p=>p&&(p.totalPicks>=state.minimumPicks||p.totalPicks<0));
     state.lastRefresh=new Date(); state.lastError='';captureDailyHistory();
   }
   function sortedPickers() {
@@ -1475,23 +1487,24 @@
     const d=state.frame.contentDocument;
     d.getElementById('bulkPickerDetail')?.remove();
     const shade=d.createElement('div');shade.id='bulkPickerDetail';shade.className='detailShade';
-    const areaRows=picker.areas.map(area=>{const rate=area.isManual?(area.picks?Math.abs(area.credit/area.picks):0):(area.isHighVolume?creditRate(area.baseArea)*state.highVolumeMultiplier:creditRate(area.area));const cls=area.isManual?(area.isRemoval?'manualRemoved':'manualAdded'):(area.isHighVolume?'highVolumeDetail':'');return `<tr class="${cls}"><td>${esc(area.isManual?area.area:displayAreaName(area.area))}</td><td>${area.isManual&&area.picks>0?'+':''}${fmt(area.picks)}</td><td>${creditFmt(rate)}</td><td>${area.isManual&&area.credit>0?'+':''}${creditFmt(area.credit)}</td><td>${area.isManual?'Manual':area.isPrescan?'Prescan':'Included'}</td></tr>`;}).join('');
+    const areaRows=picker.areas.map(area=>{const rate=area.isManual?(area.picks?Math.abs(area.credit/area.picks):0):(area.isHighVolume?creditRate(area.baseArea)*state.highVolumeMultiplier:creditRate(area.area));const cls=area.isManual?(area.isRemoval?'manualRemoved':'manualAdded'):(area.isHighVolume?'highVolumeDetail':'');const removeButton=area.isManual?`<button type="button" class="deleteManualAdjustment" data-adjustment-id="${esc(area.adjustmentId)}" aria-label="Delete ${esc(area.area)} adjustment" title="Delete adjustment" style="position:relative;z-index:2;padding:2px 6px;min-width:24px;background:#3a2027;color:#f2838d;border:1px solid #7b3b48;border-radius:3px;line-height:1;cursor:pointer">X</button>`:'';return `<tr class="${cls}"><td>${esc(area.isManual?area.area:displayAreaName(area.area))}</td><td>${area.isManual&&area.picks>0?'+':''}${fmt(area.picks)}</td><td>${creditFmt(rate)}</td><td>${area.isManual&&area.credit>0?'+':''}${creditFmt(area.credit)}</td><td>${area.isManual?'Manual':area.isPrescan?'Prescan':'Included'}</td><td>${removeButton}</td></tr>`;}).join('');
     const timeline=[...picker.all].sort((a,b)=>(parseDate(b.end)?.getTime()||0)-(parseDate(a.end)?.getTime()||0)).map(record=>{
       const raw=rawAreaName(record),mapped=areaName(record),included=isPickRecord(record)&&areaEnabled(mapped),qty=pickQty(record),credit=included?qty*creditRate(mapped):0;
       const job=record?.job_function?.display_value||record?.label||record?.type||'';
       const mapping=displayAreaName(mapped);
       return `<tr class="${included?'includedRow':'excludedRow'}"><td>${timeText(record.start)}</td><td>${timeText(record.end)}</td><td>${esc(job)}</td><td>${esc(mapping)}</td><td>${fmt(qty)}</td><td>${creditFmt(credit)}</td><td>${included?'<span class="includedTag">Included</span>':'<span class="excludedTag">Excluded</span>'}</td></tr>`;
     }).join('');
-    shade.innerHTML=`<section class="detailBox"><header class="detailHead"><div><h2>${esc(picker.label)} <small>${esc(picker.fullName)}</small></h2><p>${fmt(picker.totalPicks)} included picks | ${creditFmt(picker.totalCredit)} total credit | ${creditFmt(picker.creditPerHour)} credit/hr</p></div><div class="detailActions"><span>${picker.pickerGroup?`${esc(picker.pickerGroup.name)} | `:''}First pick ${timeText(picker.firstPick)} | ${picker.active?'ACTIVE':'INACTIVE'} | Last activity ${timeText(picker.latestEnd)}</span><button id="manualAdjustment">Manual Adjustment</button><button id="detailClose">Close</button></div></header><div class="detailBody"><div class="detailKpis"><div><span>Total Credit</span><b>${creditFmt(picker.totalCredit)}</b></div><div><span>Included Picks</span><b>${fmt(picker.totalPicks)}</b></div><div><span>Work Time</span><b>${formatDurationSeconds(picker.workSeconds)}</b></div><div><span>Current Area</span><b>${esc(picker.currentArea)}</b></div><div><span>Break/Lunch Time</span><b>${formatDurationSeconds(picker.breakSeconds)}</b></div><div><span>Credit / Net Elapsed Hr</span><b>${creditFmt(metricValue('creditPerNetElapsedHour',picker))}</b></div></div><h3>Area Credit Summary</h3><table><thead><tr><th>Area</th><th>Picks</th><th>Credit/Pick</th><th>Credit</th><th>Status</th></tr></thead><tbody>${areaRows||'<tr><td colspan="5">No included areas.</td></tr>'}</tbody></table><h3>Complete Vision Activity Timeline</h3><p class="detailNote">Disabled or non-pick records remain visible for auditing but contribute zero picks and zero credit.</p><table><thead><tr><th>Start</th><th>End</th><th>Activity</th><th>Area</th><th>Picks</th><th>Credit</th><th>Status</th></tr></thead><tbody>${timeline}</tbody></table></div></section>`;
+    shade.innerHTML=`<section class="detailBox"><header class="detailHead"><div><h2>${esc(picker.label)} <small>${esc(picker.fullName)}</small></h2><p>${fmt(picker.totalPicks)} included picks | ${creditFmt(picker.totalCredit)} total credit | ${creditFmt(picker.creditPerHour)} credit/hr</p></div><div class="detailActions"><span>${picker.pickerGroup?`${esc(picker.pickerGroup.name)} | `:''}First pick ${timeText(picker.firstPick)} | ${picker.active?'ACTIVE':'INACTIVE'} | Last activity ${timeText(picker.latestEnd)}</span><button id="manualAdjustment">Manual Adjustment</button><button id="detailClose">Close</button></div></header><div class="detailBody"><div class="detailKpis"><div><span>Total Credit</span><b>${creditFmt(picker.totalCredit)}</b></div><div><span>Included Picks</span><b>${fmt(picker.totalPicks)}</b></div><div><span>Work Time</span><b>${formatDurationSeconds(picker.workSeconds)}</b></div><div><span>Current Area</span><b>${esc(picker.currentArea)}</b></div><div><span>Break/Lunch Time</span><b>${formatDurationSeconds(picker.breakSeconds)}</b></div><div><span>Credit / Net Elapsed Hr</span><b>${creditFmt(metricValue('creditPerNetElapsedHour',picker))}</b></div></div><h3>Area Credit Summary</h3><table><thead><tr><th>Area</th><th>Picks</th><th>Credit/Pick</th><th>Credit</th><th>Status</th><th></th></tr></thead><tbody>${areaRows||'<tr><td colspan="6">No included areas.</td></tr>'}</tbody></table><h3>Complete Vision Activity Timeline</h3><p class="detailNote">Disabled or non-pick records remain visible for auditing but contribute zero picks and zero credit.</p><table><thead><tr><th>Start</th><th>End</th><th>Activity</th><th>Area</th><th>Picks</th><th>Credit</th><th>Status</th></tr></thead><tbody>${timeline}</tbody></table></div></section>`;
     d.body.appendChild(shade);
     const close=()=>shade.remove();
     shade.querySelector('#detailClose').onclick=close;
     shade.querySelector('#manualAdjustment').onclick=()=>requestSupervisorPassword('Manual Adjustment',()=>openManualAdjustmentFrame(picker));
     shade.onclick=e=>{if(e.target===shade)close();};
+    shade.addEventListener('click',event=>{const button=event.target.closest?.('.deleteManualAdjustment');if(!button)return;event.preventDefault();event.stopPropagation();const adjustment=state.manualAdjustments.find(item=>String(item.id)===button.dataset.adjustmentId);if(!adjustment)return;requestSupervisorPassword('Delete Manual Adjustment',()=>{button.disabled=true;deleteManualAdjustment(adjustment.id).then(()=>{const updatedPicker=state.pickers.find(item=>String(item.id)===String(picker.id));if(updatedPicker)openPickerDetail(updatedPicker);else close();}).catch(error=>{button.disabled=false;button.title=error.message||String(error);});});});
     shade.onkeydown=e=>{if(e.key==='Escape')close();};
     shade.tabIndex=-1;shade.focus();
   }
-  function openManualAdjustmentFrame(picker){const d=state.frame.contentDocument;d.getElementById('manualAdjust')?.remove();const sh=d.createElement('div');sh.id='manualAdjust';sh.className='miniFrameShade';sh.innerHTML=`<section class="manualBox"><h2>${esc(picker.label)} Adjustment</h2><label>Description<input id="adjName" placeholder="Example: Missed credit"></label><label>Lines<input id="adjLines" type="number" step="1" placeholder="Negative removes lines"></label><label>Credit per Line<input id="adjRate" type="number" min="0" step="0.0001"></label><small>Positive lines are added in green. Negative lines are removed in red.</small><div><button id="adjSave">Save</button><button id="adjCancel">Cancel</button></div><span id="adjMsg"></span></section>`;d.body.appendChild(sh);const close=()=>sh.remove();sh.querySelector('#adjCancel').onclick=close;sh.querySelector('#adjSave').onclick=async()=>{const name=sh.querySelector('#adjName').value.trim(),lines=Math.trunc(Number(sh.querySelector('#adjLines').value)),rate=Number(sh.querySelector('#adjRate').value);if(!name||!lines||!Number.isFinite(rate)||rate<0){sh.querySelector('#adjMsg').textContent='Enter a name, non-zero lines, and valid credit.';return}await saveManualAdjustment({id:`adj_${Date.now()}`,createdAt:new Date().toISOString(),operationalDate:state.selectedDate||operationalDate(),picker:picker.label,pickerKey:picker.label.toLowerCase(),fullName:picker.fullName,name,lines,creditPerLine:rate});close();openPickerDetail(state.pickers.find(x=>String(x.id)===String(picker.id)));};}
+  function openManualAdjustmentFrame(picker){const d=state.frame.contentDocument;d.getElementById('manualAdjust')?.remove();const sh=d.createElement('div');sh.id='manualAdjust';sh.className='miniFrameShade';sh.innerHTML=`<section class="manualBox"><h2>${esc(picker.label)} Adjustment</h2><label>Description<input id="adjName" placeholder="Example: Missed credit"></label><label>Lines<input id="adjLines" type="number" step="1" placeholder="Negative removes lines"></label><label>Credit per Line<input id="adjRate" type="number" min="0" step="0.0001"></label><small>Positive lines are added in green. Negative lines are removed in red.</small><div><button id="adjSave">Save</button><button id="adjCancel">Cancel</button></div><span id="adjMsg"></span></section>`;d.body.appendChild(sh);const close=()=>sh.remove(),saveButton=sh.querySelector('#adjSave'),message=sh.querySelector('#adjMsg');let saving=false;sh.querySelector('#adjCancel').onclick=close;saveButton.onclick=async()=>{if(saving)return;const name=sh.querySelector('#adjName').value.trim(),lines=Math.trunc(Number(sh.querySelector('#adjLines').value)),rate=Number(sh.querySelector('#adjRate').value);if(!name||!lines||!Number.isFinite(rate)||rate<0){message.textContent='Enter a name, non-zero lines, and valid credit.';return}saving=true;saveButton.disabled=true;saveButton.textContent='Saving...';message.textContent='';try{await saveManualAdjustment({id:`adj_${Date.now()}`,createdAt:new Date().toISOString(),operationalDate:state.selectedDate||operationalDate(),picker:picker.label,pickerKey:picker.label.toLowerCase(),fullName:picker.fullName,name,lines,creditPerLine:rate});close();openPickerDetail(state.pickers.find(x=>String(x.id)===String(picker.id)));}catch(error){message.textContent=error.message||String(error);saving=false;saveButton.disabled=false;saveButton.textContent='Save';}};}
   function renderTicker() {
     if(!state.ui)return;
     const top=state.ui.ticker.closest('.top'),ticker=state.ui.ticker;top.style.display='flex';state.ui.tickerViewport.style.display=state.showTicker?'block':'none';state.ui.layout.style.height='calc(100vh - 40px)';
